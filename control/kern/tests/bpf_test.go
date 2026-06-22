@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/cilium/ebpf"
+	internal "github.com/daeuniverse/dae/pkg/ebpf_internal"
 	"github.com/vishvananda/netlink/nl"
 )
 
@@ -51,13 +52,20 @@ func collectPrograms(t *testing.T) (progset []programSet, err error) {
 		return
 	}
 
+	kernelTypes, err := internal.LoadKernelSpec()
+	if err != nil {
+		return nil, fmt.Errorf("load kernel BTF: %w", err)
+	}
+
 	if err = loadBpftestObjects(obj,
 		&ebpf.CollectionOptions{
 			Maps: ebpf.MapOptions{
 				PinPath: pinPath,
 			},
 			Programs: ebpf.ProgramOptions{
-				LogSize: ebpf.DefaultVerifierLogSize * 10,
+				KernelTypes: kernelTypes,
+				// Verifier log starts at 1 MiB; cilium/ebpf grows it on demand.
+				LogSizeStart: 1 << 20,
 			},
 		},
 	); err != nil {

@@ -169,8 +169,8 @@ func NewControlPlane(
 	}
 	// var bpf bpfObjects
 	ProgramOptions := ebpf.ProgramOptions{
-		KernelTypes: nil,
-		LogSize:     ebpf.DefaultVerifierLogSize * 10,
+		// Verifier log starts at 1 MiB; cilium/ebpf grows it on demand.
+		LogSizeStart: 1 << 20,
 	}
 	if log.Level == logrus.PanicLevel {
 		ProgramOptions.LogLevel = ebpf.LogLevelBranch | ebpf.LogLevelStats

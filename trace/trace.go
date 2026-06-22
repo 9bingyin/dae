@@ -92,7 +92,7 @@ func rewriteAndLoadBpf(ipVersion int, l4ProtoNo uint16, port int) (_ *bpfObjects
 	if err != nil {
 		return nil, fmt.Errorf("failed to load BPF: %+v\n", err)
 	}
-	if err := spec.RewriteConstants(map[string]interface{}{
+	if err := internal.RewriteConstants(spec, map[string]interface{}{
 		"tracing_cfg": struct {
 			port      uint16
 			l4Proto   uint16
@@ -109,7 +109,13 @@ func rewriteAndLoadBpf(ipVersion int, l4ProtoNo uint16, port int) (_ *bpfObjects
 	}
 	var opts ebpf.CollectionOptions
 	opts.Programs.LogLevel = ebpf.LogLevelInstruction
-	opts.Programs.LogSize = ebpf.DefaultVerifierLogSize * 100
+	// Instruction-level verifier logs start higher and grow on demand.
+	opts.Programs.LogSizeStart = 8 << 20
+	kernelTypes, err := internal.LoadKernelSpec()
+	if err != nil {
+		return nil, fmt.Errorf("load kernel BTF: %w", err)
+	}
+	opts.Programs.KernelTypes = kernelTypes
 	objs := bpfObjects{}
 	if err := spec.LoadAndAssign(&objs, &opts); err != nil {
 		var (
@@ -128,7 +134,7 @@ func rewriteAndLoadBpf(ipVersion int, l4ProtoNo uint16, port int) (_ *bpfObjects
 func searchAvailableTargets() (targets map[string]int, kfreeSkbReasons map[uint64]string, err error) {
 	targets = map[string]int{}
 
-	btfSpec, err := btf.LoadKernelSpec()
+	btfSpec, err := internal.LoadKernelSpec()
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to load kernel BTF: %+v\n", err)
 	}
@@ -137,9 +143,10 @@ func searchAvailableTargets() (targets map[string]int, kfreeSkbReasons map[uint6
 		return
 	}
 
-	iter := btfSpec.Iterate()
-	for iter.Next() {
-		typ := iter.Type
+	for typ, err := range btfSpec.All() {
+		if err != nil {
+			return nil, nil, fmt.Errorf("iterate kernel BTF: %w", err)
+		}
 		fn, ok := typ.(*btf.Func)
 		if !ok {
 			continue

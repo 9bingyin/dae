@@ -212,10 +212,30 @@ func loadBpfObjectsWithConstants(obj interface{}, opts *ebpf.CollectionOptions, 
 	if err != nil {
 		return err
 	}
-	if err := spec.RewriteConstants(constants); err != nil {
+	if err := internal.RewriteConstants(spec, constants); err != nil {
 		return err
 	}
-	return spec.LoadAndAssign(obj, opts)
+	loadOpts, err := collectionOptionsWithKernelTypes(opts)
+	if err != nil {
+		return err
+	}
+	return spec.LoadAndAssign(obj, loadOpts)
+}
+
+func collectionOptionsWithKernelTypes(opts *ebpf.CollectionOptions) (*ebpf.CollectionOptions, error) {
+	var loadOpts ebpf.CollectionOptions
+	if opts != nil {
+		loadOpts = *opts
+	}
+	if loadOpts.Programs.KernelTypes != nil {
+		return &loadOpts, nil
+	}
+	kernelTypes, err := internal.LoadKernelSpec()
+	if err != nil {
+		return nil, fmt.Errorf("load kernel BTF: %w", err)
+	}
+	loadOpts.Programs.KernelTypes = kernelTypes
+	return &loadOpts, nil
 }
 
 func fullLoadBpfObjects(
