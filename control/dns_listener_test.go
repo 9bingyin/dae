@@ -6,6 +6,8 @@ import (
 	"net/netip"
 	"testing"
 
+	dnscomponent "github.com/daeuniverse/dae/component/dns"
+	"github.com/daeuniverse/dae/config"
 	dnsmessage "github.com/miekg/dns"
 	"github.com/sirupsen/logrus"
 )
@@ -71,6 +73,45 @@ func TestWriteDNSResponseUsesResponseWriter(t *testing.T) {
 	}
 	if !writer.msg.Compress {
 		t.Fatal("response should be compressed")
+	}
+}
+
+func TestHandleWithResponseWriterSkipsRejectWhenResponseNotNeeded(t *testing.T) {
+	dnsRouting, err := dnscomponent.New(&config.Dns{
+		Routing: config.DnsRouting{
+			Request:  config.DnsRequestRouting{Fallback: "reject"},
+			Response: config.DnsResponseRouting{Fallback: "accept"},
+		},
+	}, &dnscomponent.NewOption{
+		Logger: logrus.New(),
+		UpstreamReadyCallback: func(*dnscomponent.Upstream) error {
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("new DNS routing: %v", err)
+	}
+
+	controller, err := NewDnsController(dnsRouting, &DnsControllerOption{Log: logrus.New()})
+	if err != nil {
+		t.Fatalf("new DNS controller: %v", err)
+	}
+
+	msg := new(dnsmessage.Msg)
+	msg.SetQuestion("example.com.", dnsmessage.TypeA)
+	writer := new(recordingDNSResponseWriter)
+	req := &udpRequest{
+		realSrc:       netip.MustParseAddrPort("192.0.2.2:12345"),
+		realDst:       netip.MustParseAddrPort("192.0.2.1:53"),
+		src:           netip.MustParseAddrPort("192.0.2.2:12345"),
+		routingResult: &bpfRoutingResult{},
+	}
+
+	if err := controller.handleWithResponseWriter_(msg, req, false, writer); err != nil {
+		t.Fatalf("handle DNS request: %v", err)
+	}
+	if writer.msg != nil {
+		t.Fatalf("unexpected response: %+v", writer.msg)
 	}
 }
 

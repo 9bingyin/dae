@@ -475,6 +475,9 @@ func (c *DnsController) handleWithResponseWriter_(
 	if upstreamIndex == consts.DnsRequestOutboundIndex_Reject {
 		// Reject with empty answer.
 		c.RemoveDnsRespCache(cacheKey)
+		if !needResp {
+			return nil
+		}
 		return c.sendRejectWithResponseWriter_(dnsMessage, req, responseWriter)
 	}
 
