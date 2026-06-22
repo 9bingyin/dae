@@ -530,59 +530,30 @@ func (c *DnsController) handleWithResponseWriter_(
 	if err != nil {
 		return fmt.Errorf("pack DNS packet: %w", err)
 	}
-	return c.dialSend(0, req, data, dnsMessage.Id, upstream, needResp)
+	return c.dialSend(0, req, data, dnsMessage.Id, upstream, needResp, responseWriter)
 }
 
 // sendReject_ send empty answer.
-func (c *DnsController) sendReject_(dnsMessage *dnsmessage.Msg, req *udpRequest) (err error) {
+func (c *DnsController) sendReject_(dnsMessage *dnsmessage.Msg, req *udpRequest) error {
+	return c.sendRejectWithResponseWriter_(dnsMessage, req, nil)
+}
+
+// sendRejectWithResponseWriter_ sends an empty answer using response writer when available.
+func (c *DnsController) sendRejectWithResponseWriter_(dnsMessage *dnsmessage.Msg, req *udpRequest, responseWriter dnsmessage.ResponseWriter) error {
 	dnsMessage.Answer = nil
 	dnsMessage.Rcode = dnsmessage.RcodeSuccess
 	dnsMessage.Response = true
 	dnsMessage.RecursionAvailable = true
 	dnsMessage.Truncated = false
-	dnsMessage.Compress = true
 	if c.log.IsLevelEnabled(logrus.TraceLevel) {
 		c.log.WithFields(logrus.Fields{
 			"question": dnsMessage.Question,
 		}).Traceln("Reject")
 	}
-	data, err := dnsMessage.Pack()
-	if err != nil {
-		return fmt.Errorf("pack DNS packet: %w", err)
-	}
-	if err = sendPkt(c.log, data, req.realDst, req.realSrc, req.src, req.lConn); err != nil {
-		return err
-	}
-	return nil
+	return writeDNSResponse(c.log, dnsMessage, dnsMessage.Id, req, responseWriter)
 }
 
-// sendRejectWithResponseWriter_ send empty answer using response writer.
-func (c *DnsController) sendRejectWithResponseWriter_(dnsMessage *dnsmessage.Msg, req *udpRequest, responseWriter dnsmessage.ResponseWriter) (err error) {
-	dnsMessage.Answer = nil
-	dnsMessage.Rcode = dnsmessage.RcodeSuccess
-	dnsMessage.Response = true
-	dnsMessage.RecursionAvailable = true
-	dnsMessage.Truncated = false
-	dnsMessage.Compress = true
-	if c.log.IsLevelEnabled(logrus.TraceLevel) {
-		c.log.WithFields(logrus.Fields{
-			"question": dnsMessage.Question,
-		}).Traceln("Reject")
-	}
-	if responseWriter != nil {
-		return responseWriter.WriteMsg(dnsMessage)
-	}
-	data, err := dnsMessage.Pack()
-	if err != nil {
-		return fmt.Errorf("pack DNS packet: %w", err)
-	}
-	if err = sendPkt(c.log, data, req.realDst, req.realSrc, req.src, req.lConn); err != nil {
-		return err
-	}
-	return nil
-}
-
-func (c *DnsController) dialSend(invokingDepth int, req *udpRequest, data []byte, id uint16, upstream *dns.Upstream, needResp bool) (err error) {
+func (c *DnsController) dialSend(invokingDepth int, req *udpRequest, data []byte, id uint16, upstream *dns.Upstream, needResp bool, responseWriter dnsmessage.ResponseWriter) (err error) {
 	if invokingDepth >= MaxDnsLookupDepth {
 		return fmt.Errorf("too deep DNS lookup invoking (depth: %v); there may be infinite loop in your DNS response routing", MaxDnsLookupDepth)
 	}
@@ -694,7 +665,7 @@ func (c *DnsController) dialSend(invokingDepth int, req *udpRequest, data []byte
 				"next_upstream": nextUpstream.String(),
 			}).Traceln("Change DNS upstream and resend")
 		}
-		return c.dialSend(invokingDepth+1, req, data, id, nextUpstream, needResp)
+		return c.dialSend(invokingDepth+1, req, data, id, nextUpstream, needResp, responseWriter)
 	}
 	if upstreamIndex.IsReserved() && c.log.IsLevelEnabled(logrus.InfoLevel) {
 		var (
@@ -731,16 +702,21 @@ func (c *DnsController) dialSend(invokingDepth int, req *udpRequest, data []byte
 		return err
 	}
 	if needResp {
-		// Keep the id the same with request.
-		respMsg.Id = id
-		respMsg.Compress = true
-		data, err = respMsg.Pack()
-		if err != nil {
-			return err
-		}
-		if err = sendPkt(c.log, data, req.realDst, req.realSrc, req.src, req.lConn); err != nil {
-			return err
-		}
+		return writeDNSResponse(c.log, respMsg, id, req, responseWriter)
 	}
 	return nil
+}
+
+func writeDNSResponse(log *logrus.Logger, respMsg *dnsmessage.Msg, id uint16, req *udpRequest, responseWriter dnsmessage.ResponseWriter) error {
+	respMsg.Id = id
+	respMsg.Compress = true
+	if responseWriter != nil {
+		return responseWriter.WriteMsg(respMsg)
+	}
+
+	data, err := respMsg.Pack()
+	if err != nil {
+		return err
+	}
+	return sendPkt(log, data, req.realDst, req.realSrc, req.src, req.lConn)
 }
