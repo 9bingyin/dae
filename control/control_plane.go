@@ -432,18 +432,19 @@ func NewControlPlane(
 	if plane.dnsController, err = NewDnsController(dnsUpstream, &DnsControllerOption{
 		Log: log,
 		CacheAccessCallback: func(cache *DnsCache) (err error) {
-			// Write mappings into eBPF map:
-			// IP record (from dns lookup) -> domain routing
-			if err = core.BatchUpdateDomainRouting(cache); err != nil {
-				return fmt.Errorf("BatchUpdateDomainRouting: %w", err)
+			return nil
+		},
+		CacheUpdateCallback: func(oldCache, newCache *DnsCache) (err error) {
+			// Write mappings into eBPF map: IP record (from dns lookup) -> domain routing/bump state.
+			if err = core.ReplaceDomain(oldCache, newCache); err != nil {
+				return fmt.Errorf("ReplaceDomain: %w", err)
 			}
 			return nil
 		},
 		CacheRemoveCallback: func(cache *DnsCache) (err error) {
-			// Write mappings into eBPF map:
-			// IP record (from dns lookup) -> domain routing
-			if err = core.BatchRemoveDomainRouting(cache); err != nil {
-				return fmt.Errorf("BatchUpdateDomainRouting: %w", err)
+			// Write mappings into eBPF map: IP record (from dns lookup) -> domain routing/bump state.
+			if err = core.ReplaceDomain(cache, nil); err != nil {
+				return fmt.Errorf("ReplaceDomain: %w", err)
 			}
 			return nil
 		},
@@ -508,12 +509,7 @@ func NewControlPlane(
 		// Is reloading, and dnsCache == nil.
 		// Remove all map items.
 		// Normally, it is due to the change of ip version preference.
-		var key [4]uint32
-		var val bpfDomainRouting
-		iter := core.bpf.DomainRoutingMap.Iterate()
-		for iter.Next(&key, &val) {
-			_ = core.bpf.DomainRoutingMap.Delete(&key)
-		}
+		core.ClearDomainRouting()
 	}
 
 	// Init immediately to avoid DNS leaking in the very beginning because param control_plane_dns_routing will

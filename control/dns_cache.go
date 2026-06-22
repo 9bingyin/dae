@@ -14,6 +14,7 @@ import (
 )
 
 type DnsCache struct {
+	CacheKey         string
 	DomainBitmap     []uint32
 	Answer           []dnsmessage.RR
 	Deadline         time.Time

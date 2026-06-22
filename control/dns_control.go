@@ -11,6 +11,7 @@ import (
 	"math"
 	"net"
 	"net/netip"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -53,6 +54,7 @@ var (
 type DnsControllerOption struct {
 	Log                   *logrus.Logger
 	CacheAccessCallback   func(cache *DnsCache) (err error)
+	CacheUpdateCallback   func(oldCache, newCache *DnsCache) (err error)
 	CacheRemoveCallback   func(cache *DnsCache) (err error)
 	NewCache              func(fqdn string, answers []dnsmessage.RR, deadline time.Time, originalDeadline time.Time) (cache *DnsCache, err error)
 	BestDialerChooser     func(req *udpRequest, upstream *dns.Upstream) (*dialArgument, error)
@@ -69,6 +71,7 @@ type DnsController struct {
 
 	log                 *logrus.Logger
 	cacheAccessCallback func(cache *DnsCache) (err error)
+	cacheUpdateCallback func(oldCache, newCache *DnsCache) (err error)
 	cacheRemoveCallback func(cache *DnsCache) (err error)
 	newCache            func(fqdn string, answers []dnsmessage.RR, deadline time.Time, originalDeadline time.Time) (cache *DnsCache, err error)
 	bestDialerChooser   func(req *udpRequest, upstream *dns.Upstream) (*dialArgument, error)
@@ -102,6 +105,31 @@ func parseIpVersionPreference(prefer int) (uint16, error) {
 }
 
 func NewDnsController(routing *dns.Dns, option *DnsControllerOption) (c *DnsController, err error) {
+	if option == nil {
+		option = &DnsControllerOption{}
+	}
+	if option.Log == nil {
+		option.Log = logrus.New()
+	}
+	if option.CacheAccessCallback == nil {
+		option.CacheAccessCallback = func(*DnsCache) error { return nil }
+	}
+	if option.CacheUpdateCallback == nil {
+		option.CacheUpdateCallback = func(*DnsCache, *DnsCache) error { return nil }
+	}
+	if option.CacheRemoveCallback == nil {
+		option.CacheRemoveCallback = func(*DnsCache) error { return nil }
+	}
+	if option.NewCache == nil {
+		option.NewCache = func(_ string, answers []dnsmessage.RR, deadline time.Time, originalDeadline time.Time) (*DnsCache, error) {
+			return &DnsCache{
+				Answer:           answers,
+				Deadline:         deadline,
+				OriginalDeadline: originalDeadline,
+			}, nil
+		}
+	}
+
 	// Parse ip version preference.
 	prefer, err := parseIpVersionPreference(option.IpVersionPrefer)
 	if err != nil {
@@ -114,6 +142,7 @@ func NewDnsController(routing *dns.Dns, option *DnsControllerOption) (c *DnsCont
 
 		log:                   option.Log,
 		cacheAccessCallback:   option.CacheAccessCallback,
+		cacheUpdateCallback:   option.CacheUpdateCallback,
 		cacheRemoveCallback:   option.CacheRemoveCallback,
 		newCache:              option.NewCache,
 		bestDialerChooser:     option.BestDialerChooser,
@@ -133,12 +162,35 @@ func (c *DnsController) cacheKey(qname string, qtype uint16) string {
 }
 
 func (c *DnsController) RemoveDnsRespCache(cacheKey string) {
-	c.dnsCacheMu.Lock()
-	_, ok := c.dnsCache[cacheKey]
-	if ok {
-		delete(c.dnsCache, cacheKey)
+	cache, ok := c.removeDnsRespCache(cacheKey, nil)
+	if !ok {
+		return
 	}
-	c.dnsCacheMu.Unlock()
+	if err := c.cacheRemoveCallback(cache); err != nil {
+		c.log.Warnf("failed to remove DNS cache mapping: %v", err)
+	}
+}
+
+func (c *DnsController) removeDnsRespCache(cacheKey string, expected *DnsCache) (*DnsCache, bool) {
+	c.dnsCacheMu.Lock()
+	defer c.dnsCacheMu.Unlock()
+
+	cache, ok := c.dnsCache[cacheKey]
+	if !ok || expected != nil && cache != expected {
+		return nil, false
+	}
+	delete(c.dnsCache, cacheKey)
+	return cloneDnsCache(cache), true
+}
+
+func cloneDnsCache(cache *DnsCache) *DnsCache {
+	if cache == nil {
+		return nil
+	}
+	cloned := *cache
+	cloned.DomainBitmap = slices.Clone(cache.DomainBitmap)
+	cloned.Answer = slices.Clone(cache.Answer)
+	return &cloned
 }
 func (c *DnsController) LookupDnsRespCache(cacheKey string, ignoreFixedTtl bool) (cache *DnsCache) {
 	c.dnsCacheMu.Lock()
@@ -156,10 +208,16 @@ func (c *DnsController) LookupDnsRespCache(cacheKey string, ignoreFixedTtl bool)
 	// We should make sure the cache did not expire, or
 	// return nil and request a new lookup to refresh the cache.
 	if !deadline.After(time.Now()) {
+		cache, ok := c.removeDnsRespCache(cacheKey, cache)
+		if ok {
+			if err := c.cacheRemoveCallback(cache); err != nil {
+				c.log.Warnf("failed to remove expired DNS cache mapping: %v", err)
+			}
+		}
 		return nil
 	}
 	if err := c.cacheAccessCallback(cache); err != nil {
-		c.log.Warnf("failed to BatchUpdateDomainRouting: %v", err)
+		c.log.Warnf("failed to access DNS cache: %v", err)
 		return nil
 	}
 	return cache
@@ -287,9 +345,13 @@ func (c *DnsController) __updateDnsCacheDeadline(host string, dnsTyp uint16, ans
 	deadline, originalDeadline := deadlineFunc(now, host)
 
 	cacheKey := c.cacheKey(fqdn, dnsTyp)
+	var oldCache *DnsCache
+
 	c.dnsCacheMu.Lock()
 	cache, ok := c.dnsCache[cacheKey]
 	if ok {
+		oldCache = cloneDnsCache(cache)
+		cache.CacheKey = cacheKey
 		cache.Answer = answers
 		cache.Deadline = deadline
 		cache.OriginalDeadline = originalDeadline
@@ -300,8 +362,12 @@ func (c *DnsController) __updateDnsCacheDeadline(host string, dnsTyp uint16, ans
 			c.dnsCacheMu.Unlock()
 			return err
 		}
+		cache.CacheKey = cacheKey
 		c.dnsCache[cacheKey] = cache
 		c.dnsCacheMu.Unlock()
+	}
+	if err = c.cacheUpdateCallback(oldCache, cloneDnsCache(cache)); err != nil {
+		return err
 	}
 	if err = c.cacheAccessCallback(cache); err != nil {
 		return err
