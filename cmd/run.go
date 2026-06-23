@@ -254,16 +254,17 @@ loop:
 
 			// New control plane.
 			obj := c.EjectBpf()
-			var dnsCache map[string]*control.DnsCache
-			if conf.Dns.IpVersionPrefer == newConf.Dns.IpVersionPrefer {
-				// Only keep dns cache when ip version preference not change.
-				dnsCache = c.CloneDnsCache()
-			}
-			// Stop old DNS listener before creating new one to avoid port conflicts
+			// Stop old DNS listener before cloning cache to avoid losing in-flight DNS updates.
 			if err := c.StopDNSListener(); err != nil {
 				log.Warnf("[Reload] Failed to stop old DNS listener: %v", err)
 			}
-			
+			oldDnsCache := c.CloneDnsCache()
+			var dnsCache map[string]*control.DnsCache
+			if conf.Dns.IpVersionPrefer == newConf.Dns.IpVersionPrefer {
+				// Only keep dns cache when ip version preference not change.
+				dnsCache = oldDnsCache
+			}
+
 			log.Warnln("[Reload] Load new control plane")
 			newC, err := newControlPlane(log, obj, dnsCache, newConf, externGeoDataDirs)
 			if err != nil {
@@ -272,7 +273,7 @@ loop:
 					"err": err,
 				}).Errorln("[Reload] Failed to reload; try to roll back configuration")
 				// Load last config back.
-				newC, err = newControlPlane(log, obj, dnsCache, conf, externGeoDataDirs)
+				newC, err = newControlPlane(log, obj, oldDnsCache, conf, externGeoDataDirs)
 				if err != nil {
 					sdnotify.Stopping()
 					obj.Close()
@@ -296,11 +297,11 @@ loop:
 			conf = newConf
 			reloading = true
 
-			// Ready to close.
-			if abortConnections {
-				oldC.AbortConnections()
+			// Stop old accept loops immediately, but keep established TCP connections
+			// until they end naturally unless the user requested --abort.
+			if err := oldC.CloseForReload(abortConnections); err != nil {
+				log.Warnf("[Reload] Failed to close old control plane: %v", err)
 			}
-			oldC.Close()
 
 			if pprofServer != nil {
 				pprofServer.Shutdown(context.Background())

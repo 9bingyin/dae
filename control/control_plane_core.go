@@ -7,6 +7,7 @@ package control
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/netip"
 	"os"
@@ -623,19 +624,56 @@ func (c *controlPlaneCore) ReplaceDomain(oldCache, newCache *DnsCache) error {
 	}
 	if err = c.syncDomainRoutingMapsLocked(affected); err != nil {
 		c.domainRefs = previousRefs
-		_ = c.syncDomainRoutingMapsLocked(affected)
+		if rollbackErr := c.syncDomainRoutingMapsLocked(affected); rollbackErr != nil {
+			return fmt.Errorf("%w; rollback domain routing: %v", err, rollbackErr)
+		}
 		return err
 	}
 	return nil
 }
 
-func (c *controlPlaneCore) ClearDomainRouting() {
+func (c *controlPlaneCore) ClearDomainRouting() error {
 	c.domainMapMu.Lock()
+	previousRefs := c.domainRefs
 	c.domainRefs = make(map[netip.Addr]map[string][]uint32)
 	c.domainMapMu.Unlock()
 
-	deleteAllDomainRoutingMap(c.bpf.DomainRoutingMap)
-	deleteAllDomainRoutingMap(c.bpf.DomainBumpMap)
+	routingSnapshot, err := snapshotDomainRoutingMap(c.bpf.DomainRoutingMap)
+	if err != nil {
+		c.restoreDomainRefs(previousRefs)
+		return err
+	}
+	bumpSnapshot, err := snapshotDomainRoutingMap(c.bpf.DomainBumpMap)
+	if err != nil {
+		c.restoreDomainRefs(previousRefs)
+		return err
+	}
+
+	if err = deleteAllDomainRoutingMap(c.bpf.DomainRoutingMap); err != nil {
+		c.restoreDomainRefs(previousRefs)
+		if restoreErr := restoreDomainRoutingMap(c.bpf.DomainRoutingMap, routingSnapshot); restoreErr != nil {
+			return fmt.Errorf("%w; restore domain routing map: %v", err, restoreErr)
+		}
+		return err
+	}
+	if err = deleteAllDomainRoutingMap(c.bpf.DomainBumpMap); err != nil {
+		c.restoreDomainRefs(previousRefs)
+		restoreErr := errors.Join(
+			restoreDomainRoutingMap(c.bpf.DomainRoutingMap, routingSnapshot),
+			restoreDomainRoutingMap(c.bpf.DomainBumpMap, bumpSnapshot),
+		)
+		if restoreErr != nil {
+			return fmt.Errorf("%w; restore domain routing maps: %v", err, restoreErr)
+		}
+		return err
+	}
+	return nil
+}
+
+func (c *controlPlaneCore) restoreDomainRefs(refs map[netip.Addr]map[string][]uint32) {
+	c.domainMapMu.Lock()
+	c.domainRefs = refs
+	c.domainMapMu.Unlock()
 }
 
 func cloneDomainRefs(refs map[netip.Addr]map[string][]uint32) map[netip.Addr]map[string][]uint32 {
@@ -803,13 +841,52 @@ func domainCacheIPs(cache *DnsCache) []netip.Addr {
 	return ips
 }
 
-func deleteAllDomainRoutingMap(m *ebpf.Map) {
+func snapshotDomainRoutingMap(m *ebpf.Map) (map[[4]uint32]bpfDomainRouting, error) {
+	snapshot := make(map[[4]uint32]bpfDomainRouting)
 	var key [4]uint32
 	var val bpfDomainRouting
 	iter := m.Iterate()
 	for iter.Next(&key, &val) {
-		_ = m.Delete(&key)
+		snapshot[key] = val
 	}
+	return snapshot, iter.Err()
+}
+
+func restoreDomainRoutingMap(m *ebpf.Map, snapshot map[[4]uint32]bpfDomainRouting) error {
+	if err := deleteAllDomainRoutingMap(m); err != nil {
+		return err
+	}
+	if len(snapshot) == 0 {
+		return nil
+	}
+	keys := make([][4]uint32, 0, len(snapshot))
+	values := make([]bpfDomainRouting, 0, len(snapshot))
+	for key, val := range snapshot {
+		keys = append(keys, key)
+		values = append(values, val)
+	}
+	_, err := BpfMapBatchUpdate(m, keys, values, &ebpf.BatchOptions{
+		ElemFlags: uint64(ebpf.UpdateAny),
+	})
+	return err
+}
+
+func deleteAllDomainRoutingMap(m *ebpf.Map) error {
+	var key [4]uint32
+	var val bpfDomainRouting
+	keys := make([][4]uint32, 0)
+	iter := m.Iterate()
+	for iter.Next(&key, &val) {
+		keys = append(keys, key)
+	}
+	if err := iter.Err(); err != nil {
+		return err
+	}
+	if len(keys) == 0 {
+		return nil
+	}
+	_, err := BpfMapBatchDelete(m, keys)
+	return err
 }
 
 // EjectBpf will resect bpf from destroying life-cycle of control plane core.

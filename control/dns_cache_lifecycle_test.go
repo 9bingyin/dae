@@ -73,14 +73,116 @@ func TestDnsCacheExpiredLookupRemovesMapping(t *testing.T) {
 	assertRemovedCache(t, recorder.removed, "192.0.2.1")
 }
 
+func TestDnsCacheImportRebuildsDomainBitmap(t *testing.T) {
+	recorder := new(dnsCacheLifecycleRecorder)
+	controller := newDnsCacheLifecycleControllerWithBitmap(t, recorder, testDomainBitmap(1))
+	cacheKey := controller.cacheKey("example.com.", dnsmessage.TypeA)
+	deadline := time.Now().Add(time.Minute)
+	caches := map[string]*DnsCache{
+		cacheKey: newTestImportDnsCache(cacheKey, deadline, deadline),
+	}
+
+	imported, err := controller.ImportDnsCache(caches)
+	if err != nil {
+		t.Fatalf("import DNS cache: %v", err)
+	}
+	if len(imported) != 1 {
+		t.Fatalf("imported count: got %d, want 1", len(imported))
+	}
+
+	cache := controller.LookupDnsRespCache(cacheKey, false)
+	if cache == nil {
+		t.Fatal("imported cache should be available")
+	}
+	assertDomainBitmapBit(t, cache.DomainBitmap, 0, false)
+	assertDomainBitmapBit(t, cache.DomainBitmap, 1, true)
+	if len(recorder.updates) != 1 {
+		t.Fatalf("unexpected update count: got %d, want 1", len(recorder.updates))
+	}
+	if recorder.updates[0].newCache.CacheKey != cacheKey {
+		t.Fatalf("imported cache key: got %q, want %q", recorder.updates[0].newCache.CacheKey, cacheKey)
+	}
+}
+
+func TestDnsCacheImportSkipsExpiredCache(t *testing.T) {
+	recorder := new(dnsCacheLifecycleRecorder)
+	controller := newDnsCacheLifecycleController(t, recorder)
+	cacheKey := controller.cacheKey("example.com.", dnsmessage.TypeA)
+	deadline := time.Now().Add(-time.Minute)
+	caches := map[string]*DnsCache{
+		cacheKey: newTestImportDnsCache(cacheKey, deadline, deadline),
+	}
+
+	imported, err := controller.ImportDnsCache(caches)
+	if err != nil {
+		t.Fatalf("import DNS cache: %v", err)
+	}
+	if len(imported) != 0 {
+		t.Fatalf("imported count: got %d, want 0", len(imported))
+	}
+	if cache := controller.LookupDnsRespCache(cacheKey, false); cache != nil {
+		t.Fatal("expired cache should not be imported")
+	}
+	if len(recorder.updates) != 0 {
+		t.Fatalf("unexpected update count: got %d, want 0", len(recorder.updates))
+	}
+}
+
+func TestDnsCacheImportSkipsInvalidCacheKey(t *testing.T) {
+	recorder := new(dnsCacheLifecycleRecorder)
+	controller := newDnsCacheLifecycleController(t, recorder)
+	deadline := time.Now().Add(time.Minute)
+	caches := map[string]*DnsCache{
+		"invalid": newTestImportDnsCache("invalid", deadline, deadline),
+	}
+
+	imported, err := controller.ImportDnsCache(caches)
+	if err != nil {
+		t.Fatalf("import DNS cache: %v", err)
+	}
+	if len(imported) != 0 {
+		t.Fatalf("imported count: got %d, want 0", len(imported))
+	}
+	if len(recorder.updates) != 0 {
+		t.Fatalf("unexpected update count: got %d, want 0", len(recorder.updates))
+	}
+}
+
+func TestDnsCacheImportKeepsOriginalDeadlineCache(t *testing.T) {
+	recorder := new(dnsCacheLifecycleRecorder)
+	controller := newDnsCacheLifecycleController(t, recorder)
+	cacheKey := controller.cacheKey("example.com.", dnsmessage.TypeA)
+	deadline := time.Now().Add(-time.Minute)
+	originalDeadline := time.Now().Add(time.Minute)
+	caches := map[string]*DnsCache{
+		cacheKey: newTestImportDnsCache(cacheKey, deadline, originalDeadline),
+	}
+
+	imported, err := controller.ImportDnsCache(caches)
+	if err != nil {
+		t.Fatalf("import DNS cache: %v", err)
+	}
+	if len(imported) != 1 {
+		t.Fatalf("imported count: got %d, want 1", len(imported))
+	}
+	if cache := controller.LookupDnsRespCache(cacheKey, true); cache == nil {
+		t.Fatal("cache with live original deadline should be available when fixed TTL is ignored")
+	}
+}
+
 func newDnsCacheLifecycleController(t *testing.T, recorder *dnsCacheLifecycleRecorder) *DnsController {
+	t.Helper()
+	return newDnsCacheLifecycleControllerWithBitmap(t, recorder, testDomainBitmap(0))
+}
+
+func newDnsCacheLifecycleControllerWithBitmap(t *testing.T, recorder *dnsCacheLifecycleRecorder, bitmap []uint32) *DnsController {
 	t.Helper()
 
 	controller, err := NewDnsController(nil, &DnsControllerOption{
 		Log: logrus.New(),
 		NewCache: func(_ string, answers []dnsmessage.RR, deadline time.Time, originalDeadline time.Time) (*DnsCache, error) {
 			return &DnsCache{
-				DomainBitmap:     testDomainBitmap(0),
+				DomainBitmap:     bitmap,
 				Answer:           answers,
 				Deadline:         deadline,
 				OriginalDeadline: originalDeadline,
@@ -113,6 +215,16 @@ func updateTestDnsCache(t *testing.T, controller *DnsController, ip string, ttl 
 	}
 }
 
+func newTestImportDnsCache(cacheKey string, deadline time.Time, originalDeadline time.Time) *DnsCache {
+	return &DnsCache{
+		CacheKey:         cacheKey,
+		DomainBitmap:     testDomainBitmap(0),
+		Answer:           testDnsCache("", nil, "192.0.2.1").Answer,
+		Deadline:         deadline,
+		OriginalDeadline: originalDeadline,
+	}
+}
+
 func assertRemovedCache(t *testing.T, removed []*DnsCache, ip string) {
 	t.Helper()
 
@@ -124,5 +236,13 @@ func assertRemovedCache(t *testing.T, removed []*DnsCache, ip string) {
 	}
 	if !removed[0].IncludeIp(testAddr(ip)) {
 		t.Fatalf("removed cache should include %s", ip)
+	}
+}
+
+func assertDomainBitmapBit(t *testing.T, bitmap []uint32, bit int, want bool) {
+	t.Helper()
+	got := bitmap[bit/32]&(1<<(bit%32)) != 0
+	if got != want {
+		t.Fatalf("domain bitmap bit %d: got %v, want %v", bit, got, want)
 	}
 }

@@ -63,6 +63,13 @@ type ControlPlane struct {
 	// TODO: add mutex?
 	outbounds     []*outbound.DialerGroup
 	inConnections sync.Map
+	tcpWg         sync.WaitGroup
+	serveWg       sync.WaitGroup
+	serveMu       sync.Mutex
+	serveListener *Listener
+
+	closeDeferOnce sync.Once
+	closeDeferErr  error
 
 	dnsController    *DnsController
 	dnsListener      *DNSListener
@@ -411,6 +418,7 @@ func NewControlPlane(
 	defer func() {
 		if err != nil {
 			cancel()
+			_ = plane.closeDeferred()
 		}
 	}()
 
@@ -429,12 +437,16 @@ func NewControlPlane(
 	if err != nil {
 		return nil, err
 	}
+	domainRoutingActive := true
 	if plane.dnsController, err = NewDnsController(dnsUpstream, &DnsControllerOption{
 		Log: log,
 		CacheAccessCallback: func(cache *DnsCache) (err error) {
 			return nil
 		},
 		CacheUpdateCallback: func(oldCache, newCache *DnsCache) (err error) {
+			if !domainRoutingActive {
+				return nil
+			}
 			// Write mappings into eBPF map: IP record (from dns lookup) -> domain routing/bump state.
 			if err = core.ReplaceDomain(oldCache, newCache); err != nil {
 				return fmt.Errorf("ReplaceDomain: %w", err)
@@ -442,6 +454,9 @@ func NewControlPlane(
 			return nil
 		},
 		CacheRemoveCallback: func(cache *DnsCache) (err error) {
+			if !domainRoutingActive {
+				return nil
+			}
 			// Write mappings into eBPF map: IP record (from dns lookup) -> domain routing/bump state.
 			if err = core.ReplaceDomain(cache, nil); err != nil {
 				return fmt.Errorf("ReplaceDomain: %w", err)
@@ -470,53 +485,49 @@ func NewControlPlane(
 		return nil, err
 	}
 
-	// Create and start DNS listener if configured
+	// Init immediately to avoid DNS leaking in the very beginning because param control_plane_dns_routing will
+	// be set in callback.
+	if err = dnsUpstream.CheckUpstreamsFormat(); err != nil {
+		return nil, err
+	}
+
+	// Create and start DNS listener after validation. Constructor cleanup will stop it on later errors.
 	if dnsConfig.Bind != "" {
 		plane.dnsListener, err = NewDNSListener(log, dnsConfig.Bind, plane)
 		if err != nil {
 			return nil, err
 		}
 		if err = plane.dnsListener.Start(); err != nil {
-			log.Errorf("Failed to start DNS listener: %v", err)
-		} else {
-			log.Infof("DNS listener started on %s", dnsConfig.Bind)
-			// Add DNS listener stop to defer functions
-			deferFuncs = append(deferFuncs, plane.dnsListener.Stop)
+			return nil, fmt.Errorf("start DNS listener: %w", err)
 		}
-	}
-	// Refresh domain routing cache with new routing.
-	// FIXME: We temperarily disable it because we want to make change of DNS section take effects immediately.
-	// TODO: Add change detection.
-	if false && len(dnsCache) > 0 {
-		for cacheKey, cache := range dnsCache {
-			// Also refresh out-dated routing because kernel map items have no expiration.
-			lastDot := strings.LastIndex(cacheKey, ".")
-			if lastDot == -1 || lastDot == len(cacheKey)-1 {
-				// Not a valid key.
-				log.Warnln("Invalid cache key:", cacheKey)
-				continue
-			}
-			host := cacheKey[:lastDot]
-			_typ := cacheKey[lastDot+1:]
-			typ, err := strconv.ParseUint(_typ, 10, 16)
-			if err != nil {
-				// Unexpected.
-				return nil, err
-			}
-			_ = plane.dnsController.UpdateDnsCacheDeadline(host, uint16(typ), cache.Answer, cache.Deadline)
-		}
-	} else if _bpf != nil {
-		// Is reloading, and dnsCache == nil.
-		// Remove all map items.
-		// Normally, it is due to the change of ip version preference.
-		core.ClearDomainRouting()
+		log.Infof("DNS listener started on %s", dnsConfig.Bind)
+		plane.deferFuncs = append(plane.deferFuncs, plane.dnsListener.Stop)
 	}
 
-	// Init immediately to avoid DNS leaking in the very beginning because param control_plane_dns_routing will
-	// be set in callback.
-	if err = dnsUpstream.CheckUpstreamsFormat(); err != nil {
-		return nil, err
+	var importedCaches []*DnsCache
+	if len(dnsCache) > 0 {
+		domainRoutingActive = false
+		importedCaches, err = plane.dnsController.ImportDnsCache(dnsCache)
+		domainRoutingActive = true
+		if err != nil {
+			return nil, fmt.Errorf("import DNS cache: %w", err)
+		}
+		log.Infof("Imported %d DNS cache entries", len(importedCaches))
 	}
+
+	// Kernel maps are reused on reload, so rebuild domain routing/bump maps after
+	// all other fallible initialization succeeds.
+	if _bpf != nil {
+		if err = core.ClearDomainRouting(); err != nil {
+			return nil, fmt.Errorf("clear domain routing: %w", err)
+		}
+	}
+	for _, cache := range importedCaches {
+		if err = core.ReplaceDomain(nil, cache); err != nil {
+			return nil, fmt.Errorf("restore domain routing: %w", err)
+		}
+	}
+
 	go dnsUpstream.InitUpstreams()
 
 	close(plane.ready)
@@ -747,6 +758,84 @@ func (l *Listener) Close() error {
 	return err
 }
 
+func (l *Listener) Copy() (*Listener, error) {
+	tcpFile, err := l.tcpListener.(*net.TCPListener).File()
+	if err != nil {
+		return nil, fmt.Errorf("failed to copy TCP listener file: %w", err)
+	}
+	defer tcpFile.Close()
+	tcpListener, err := net.FileListener(tcpFile)
+	if err != nil {
+		return nil, fmt.Errorf("failed to copy TCP listener: %w", err)
+	}
+
+	udpFile, err := l.packetConn.(*net.UDPConn).File()
+	if err != nil {
+		_ = tcpListener.Close()
+		return nil, fmt.Errorf("failed to copy UDP listener file: %w", err)
+	}
+	defer udpFile.Close()
+	packetConn, err := net.FilePacketConn(udpFile)
+	if err != nil {
+		_ = tcpListener.Close()
+		return nil, fmt.Errorf("failed to copy UDP listener: %w", err)
+	}
+
+	return &Listener{
+		tcpListener: tcpListener,
+		packetConn:  packetConn,
+		port:        l.port,
+	}, nil
+}
+
+func (c *ControlPlane) setServeListener(listener *Listener) {
+	c.serveMu.Lock()
+	c.serveListener = listener
+	c.serveMu.Unlock()
+}
+
+func (c *ControlPlane) clearServeListener(listener *Listener) {
+	c.serveMu.Lock()
+	if c.serveListener == listener {
+		c.serveListener = nil
+	}
+	c.serveMu.Unlock()
+}
+
+func (c *ControlPlane) closeServeListener() error {
+	c.serveMu.Lock()
+	listener := c.serveListener
+	c.serveListener = nil
+	c.serveMu.Unlock()
+	if listener == nil {
+		return nil
+	}
+	return listener.Close()
+}
+
+type syscallConn interface {
+	SyscallConn() (syscall.RawConn, error)
+}
+
+func socketFD(conn syscallConn) (fd uint64, err error) {
+	rawConn, err := conn.SyscallConn()
+	if err != nil {
+		return 0, err
+	}
+	err = rawConn.Control(func(rawFd uintptr) {
+		fd = uint64(rawFd)
+	})
+	return fd, err
+}
+
+func (c *ControlPlane) updateListenSocketMap(key consts.ParamKey, conn syscallConn, description string) error {
+	fd, err := socketFD(conn)
+	if err != nil {
+		return fmt.Errorf("failed to retrieve %s fd: %w", description, err)
+	}
+	return c.core.bpf.ListenSocketMap.Update(key, fd, ebpf.UpdateAny)
+}
+
 func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err error) {
 	sentReady := false
 	defer func() {
@@ -754,48 +843,55 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 			readyChan <- false
 		}
 	}()
-	udpConn := listener.packetConn.(*net.UDPConn)
+	serveListener, err := listener.Copy()
+	if err != nil {
+		return err
+	}
+	c.setServeListener(serveListener)
+	defer func() {
+		c.clearServeListener(serveListener)
+		_ = serveListener.Close()
+	}()
+
+	udpConn := serveListener.packetConn.(*net.UDPConn)
+	tcpListener := serveListener.tcpListener.(*net.TCPListener)
 	/// Serve.
 	// TCP socket.
-	tcpFile, err := listener.tcpListener.(*net.TCPListener).File()
-	if err != nil {
-		return fmt.Errorf("failed to retrieve copy of the underlying TCP connection file")
-	}
-	c.deferFuncs = append(c.deferFuncs, func() error {
-		return tcpFile.Close()
-	})
-	if err := c.core.bpf.ListenSocketMap.Update(consts.ZeroKey, uint64(tcpFile.Fd()), ebpf.UpdateAny); err != nil {
+	if err := c.updateListenSocketMap(consts.ZeroKey, tcpListener, "TCP listener"); err != nil {
 		return err
 	}
 	// UDP socket.
-	udpFile, err := udpConn.File()
-	if err != nil {
-		return fmt.Errorf("failed to retrieve copy of the underlying UDP connection file")
-	}
-	c.deferFuncs = append(c.deferFuncs, func() error {
-		return udpFile.Close()
-	})
-	if err := c.core.bpf.ListenSocketMap.Update(consts.OneKey, uint64(udpFile.Fd()), ebpf.UpdateAny); err != nil {
+	if err := c.updateListenSocketMap(consts.OneKey, udpConn, "UDP listener"); err != nil {
 		return err
 	}
 
+	c.serveWg.Add(2)
 	sentReady = true
 	readyChan <- true
 	go func() {
+		defer c.serveWg.Done()
 		for {
-			select {
-			case <-c.ctx.Done():
-				return
-			default:
-			}
-			lconn, err := listener.tcpListener.Accept()
+			lconn, err := tcpListener.Accept()
 			if err != nil {
+				select {
+				case <-c.ctx.Done():
+					return
+				default:
+				}
 				if !strings.Contains(err.Error(), "use of closed network connection") {
 					c.log.Errorf("Error when accept: %v", err)
 				}
 				break
 			}
+			select {
+			case <-c.ctx.Done():
+				_ = lconn.Close()
+				return
+			default:
+			}
+			c.tcpWg.Add(1)
 			go func(lconn net.Conn) {
+				defer c.tcpWg.Done()
 				c.inConnections.Store(lconn, struct{}{})
 				defer c.inConnections.Delete(lconn)
 				if err := c.handleConn(lconn); err != nil {
@@ -805,21 +901,27 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 		}
 	}()
 	go func() {
+		defer c.serveWg.Done()
 		buf := pool.GetFullCap(consts.EthernetMtu)
 		var oob [120]byte // Size for original dest
 		defer buf.Put()
 		for {
-			select {
-			case <-c.ctx.Done():
-				return
-			default:
-			}
 			n, oobn, _, src, err := udpConn.ReadMsgUDPAddrPort(buf, oob[:])
 			if err != nil {
+				select {
+				case <-c.ctx.Done():
+					return
+				default:
+				}
 				if !strings.Contains(err.Error(), "use of closed network connection") {
 					c.log.Errorf("ReadFromUDPAddrPort: %v, %v", src.String(), err)
 				}
 				break
+			}
+			select {
+			case <-c.ctx.Done():
+				return
+			default:
 			}
 			newBuf := pool.Get(n)
 			copy(newBuf, buf[:n])
@@ -830,6 +932,11 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 			// Debug:
 			// t := time.Now()
 			DefaultUdpTaskPool.EmitTask(convergeSrc.String(), func() {
+				select {
+				case <-c.ctx.Done():
+					return
+				default:
+				}
 				data := newBuf
 				oob := newOob
 				src := newSrc
@@ -857,6 +964,8 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 	}()
 	c.ActivateCheck()
 	<-c.ctx.Done()
+	_ = c.closeServeListener()
+	c.serveWg.Wait()
 	return nil
 }
 
@@ -1048,20 +1157,48 @@ func (c *ControlPlane) SnapshotNodeLatencies() []NodeLatencySnapshot {
 	return results
 }
 
-func (c *ControlPlane) Close() (err error) {
-	// Invoke defer funcs in reverse order.
-	for i := len(c.deferFuncs) - 1; i >= 0; i-- {
-		if e := c.deferFuncs[i](); e != nil {
-			// Combine errors.
-			if err != nil {
-				err = fmt.Errorf("%w; %v", err, e)
-			} else {
-				err = e
+func (c *ControlPlane) closeDeferred() error {
+	c.closeDeferOnce.Do(func() {
+		// Invoke defer funcs in reverse order.
+		for i := len(c.deferFuncs) - 1; i >= 0; i-- {
+			if err := c.deferFuncs[i](); err != nil {
+				c.closeDeferErr = errors.Join(c.closeDeferErr, err)
 			}
 		}
-	}
+	})
+	return c.closeDeferErr
+}
+
+func (c *ControlPlane) Close() error {
 	c.cancel()
-	return c.core.Close()
+	_ = c.closeServeListener()
+	c.serveWg.Wait()
+	return errors.Join(c.closeDeferred(), c.core.Close())
+}
+
+func (c *ControlPlane) CloseForReload(abortConnections bool) error {
+	c.cancel()
+	_ = c.closeServeListener()
+	c.serveWg.Wait()
+
+	if abortConnections {
+		if err := c.AbortConnections(); err != nil {
+			c.log.Warnf("failed to abort old TCP connections: %v", err)
+		}
+		return errors.Join(c.core.Close(), c.closeDeferred())
+	}
+
+	if active := c.ActiveTCPConnections(); active > 0 {
+		c.log.Infof("Draining %d old TCP connections after reload", active)
+	}
+	go func() {
+		c.tcpWg.Wait()
+		if err := errors.Join(c.closeDeferred(), c.core.Close()); err != nil {
+			c.log.Warnf("failed to close drained old control plane: %v", err)
+		}
+		c.log.Infof("Drained old TCP connections after reload")
+	}()
+	return nil
 }
 
 func bestNodeLatencySnapshotForDialer(d *dialer.Dialer) NodeLatencySnapshot {

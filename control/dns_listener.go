@@ -240,6 +240,11 @@ type dnsHandler struct {
 
 // ServeDNS handles DNS requests.
 func (h *dnsHandler) ServeDNS(w dnsmessage.ResponseWriter, r *dnsmessage.Msg) {
+	select {
+	case <-h.controller.ctx.Done():
+		return
+	case <-h.controller.ready:
+	}
 	clientIPPort, err := addrPortFromNetAddr(w.RemoteAddr())
 	if err != nil {
 		h.log.Errorf("Failed to parse client address: %v", err)

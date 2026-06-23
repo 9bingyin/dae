@@ -161,6 +161,70 @@ func (c *DnsController) cacheKey(qname string, qtype uint16) string {
 	return dnsmessage.CanonicalName(qname) + strconv.Itoa(int(qtype))
 }
 
+func splitDnsCacheKey(cacheKey string) (fqdn string, ok bool) {
+	lastDot := strings.LastIndex(cacheKey, ".")
+	if lastDot == -1 || lastDot == len(cacheKey)-1 {
+		return "", false
+	}
+	if _, err := strconv.ParseUint(cacheKey[lastDot+1:], 10, 16); err != nil {
+		return "", false
+	}
+	return dnsmessage.CanonicalName(cacheKey[:lastDot]), true
+}
+
+func dnsCacheExpired(cache *DnsCache, now time.Time) bool {
+	return !cache.Deadline.After(now) && !cache.OriginalDeadline.After(now)
+}
+
+func (c *DnsController) ImportDnsCache(caches map[string]*DnsCache) ([]*DnsCache, error) {
+	now := time.Now()
+	imported := make([]*DnsCache, 0, len(caches))
+	for cacheKey, cache := range caches {
+		if cache == nil || dnsCacheExpired(cache, now) {
+			continue
+		}
+		fqdn, ok := splitDnsCacheKey(cacheKey)
+		if !ok {
+			c.log.Warnln("Invalid DNS cache key:", cacheKey)
+			continue
+		}
+		newCache, err := c.importDnsCache(cacheKey, fqdn, cache)
+		if err != nil {
+			return imported, err
+		}
+		imported = append(imported, newCache)
+	}
+	return imported, nil
+}
+
+func (c *DnsController) importDnsCache(cacheKey string, fqdn string, cache *DnsCache) (*DnsCache, error) {
+	newCache, err := c.newCache(fqdn, slices.Clone(cache.Answer), cache.Deadline, cache.OriginalDeadline)
+	if err != nil {
+		return nil, err
+	}
+	newCache.CacheKey = cacheKey
+
+	var oldCache *DnsCache
+	c.dnsCacheMu.Lock()
+	if cache, ok := c.dnsCache[cacheKey]; ok {
+		oldCache = cloneDnsCache(cache)
+	}
+	c.dnsCache[cacheKey] = newCache
+	c.dnsCacheMu.Unlock()
+
+	if err = c.cacheUpdateCallback(oldCache, cloneDnsCache(newCache)); err != nil {
+		c.dnsCacheMu.Lock()
+		if oldCache == nil {
+			delete(c.dnsCache, cacheKey)
+		} else {
+			c.dnsCache[cacheKey] = oldCache
+		}
+		c.dnsCacheMu.Unlock()
+		return nil, err
+	}
+	return cloneDnsCache(newCache), nil
+}
+
 func (c *DnsController) RemoveDnsRespCache(cacheKey string) {
 	cache, ok := c.removeDnsRespCache(cacheKey, nil)
 	if !ok {
