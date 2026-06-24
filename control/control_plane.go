@@ -1181,11 +1181,12 @@ func (c *ControlPlane) CloseForReload(abortConnections bool) error {
 	_ = c.closeServeListener()
 	c.serveWg.Wait()
 
+	coreErr := c.core.Close()
 	if abortConnections {
 		if err := c.AbortConnections(); err != nil {
 			c.log.Warnf("failed to abort old TCP connections: %v", err)
 		}
-		return errors.Join(c.core.Close(), c.closeDeferred())
+		return errors.Join(coreErr, c.closeDeferred())
 	}
 
 	if active := c.ActiveTCPConnections(); active > 0 {
@@ -1193,12 +1194,12 @@ func (c *ControlPlane) CloseForReload(abortConnections bool) error {
 	}
 	go func() {
 		c.tcpWg.Wait()
-		if err := errors.Join(c.closeDeferred(), c.core.Close()); err != nil {
-			c.log.Warnf("failed to close drained old control plane: %v", err)
+		if err := c.closeDeferred(); err != nil {
+			c.log.Warnf("failed to close drained old control plane resources: %v", err)
 		}
 		c.log.Infof("Drained old TCP connections after reload")
 	}()
-	return nil
+	return coreErr
 }
 
 func bestNodeLatencySnapshotForDialer(d *dialer.Dialer) NodeLatencySnapshot {
