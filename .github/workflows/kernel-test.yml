@@ -48,11 +48,11 @@ jobs:
       fail-fast: false
       matrix:
         kernel:
-          - '6.6-main'
-          - '6.12-main'
-          - '6.18-main'
-          - 'bpf-net-main'
-          - 'bpf-next-main'
+          - '6.6-20260706.013554'
+          - '6.12-20260706.013554'
+          - '6.18-20260706.013554'
+          - 'bpf-net-20260706.013554'
+          - 'bpf-next-20260706.013554'
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@d632683dd7b4114ad314bca15554477dd762a938 # v4.2.0
