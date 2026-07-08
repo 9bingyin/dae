@@ -13,6 +13,7 @@ name: PR Build (Preview)
 run-name:  "#${{ github.event.pull_request.number }} - ${{ github.event.pull_request.title }} @${{ github.event.pull_request.head.ref }}:${{ github.event.pull_request.head.sha }}"
 
 on:
+  workflow_dispatch:
   pull_request:
     types: [ opened, synchronize, reopened, ready_for_review ]
     paths:
@@ -21,8 +22,8 @@ on:
       - "**/*.h"
       - "go.mod"
       - "go.sum"
-      - "devenv.nix"
-      - "devenv.yaml"
+      - "flake.nix"
+      - "flake.lock"
       - ".github/workflows/pr-build.yml"
       - ".github/workflows/seed-build.yml"
 

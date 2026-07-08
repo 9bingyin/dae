@@ -12,6 +12,7 @@
 name: Build (Main)
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - main
@@ -22,8 +23,8 @@ on:
       - "**/*.h"
       - "go.mod"
       - "go.sum"
-      - "devenv.nix"
-      - "devenv.yaml"
+      - "flake.nix"
+      - "flake.lock"
       - ".github/workflows/build.yml"
       - ".github/workflows/seed-build.yml"
       - "Makefile"
