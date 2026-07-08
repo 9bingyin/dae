@@ -2,8 +2,8 @@
 lan=docker0
 wan=enp5s0
 
-sudo tc qdisc add dev $lan clsact > /dev/null 2>&1
-sudo tc qdisc add dev $wan clsact > /dev/null 2>&1
+sudo tc qdisc add dev $lan clsact >/dev/null 2>&1
+sudo tc qdisc add dev $wan clsact >/dev/null 2>&1
 
 set -ex
 

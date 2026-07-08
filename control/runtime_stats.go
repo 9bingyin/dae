@@ -46,8 +46,8 @@ type runtimeBucket struct {
 type runtimeStats struct {
 	mu sync.Mutex
 
-	currentBucketStart time.Time
-	currentUploadBytes uint64
+	currentBucketStart   time.Time
+	currentUploadBytes   uint64
 	currentDownloadBytes uint64
 
 	uploadTotal   uint64

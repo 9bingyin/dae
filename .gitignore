@@ -14,3 +14,11 @@ node_modules/
 .build_tags
 .checkpatch-camelcase.git.
 venv
+
+# Devenv
+.devenv*
+devenv.local.nix
+devenv.local.yaml
+
+# direnv
+.direnv
