@@ -7,6 +7,8 @@ on:
       - "**/*.h"
       - "go.mod"
       - "go.sum"
+      - "flake.nix"
+      - "flake.lock"
       - ".github/workflows/bpf-test.yml"
 
 permissions: read-all
@@ -16,14 +18,17 @@ jobs:
     name: BPF Unit Test
     runs-on: ubuntu-latest
     continue-on-error: true
+    defaults:
+      run:
+        shell: nix develop --impure . --command bash -e {0}
     strategy:
       matrix:
-        env:
-        - VERSION: 15
-        - VERSION: 16
-        - VERSION: 17
-        - VERSION: 18
-        - VERSION: 19
+        clang_version:
+          - "18"
+          - "19"
+          - "20"
+          - "21"
+          - "22"
 
     steps:
       - name: Checkout code
@@ -32,15 +37,16 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
-      - name: Install Dependencies
-        env: ${{ matrix.env }}
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y clang-$VERSION llvm-$VERSION
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
 
       - name: Run BPF tests
-        env: ${{ matrix.env }}
+        env:
+          CLANG_VERSION: ${{ matrix.clang_version }}
         run: |
           git submodule update --init
-          sudo CLANG=clang-$VERSION make ebpf-test || (echo "Run 'make ebpf-test' locally to investigate failures"; exit 1)
+          sudo -E make ebpf-test || (echo "Run 'make ebpf-test' locally to investigate failures"; exit 1)
 

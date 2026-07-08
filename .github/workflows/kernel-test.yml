@@ -8,33 +8,36 @@ on:
       - "**/*.h"
       - "go.mod"
       - "go.sum"
+      - "flake.nix"
+      - "flake.lock"
       - ".github/workflows/kernel-test.yml"
 
 jobs:
 
   build:
     runs-on: ubuntu-22.04
+    defaults:
+      run:
+        shell: nix develop --impure . --command bash -e {0}
     steps:
-    - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-    - name: Set up Go
-      uses: actions/setup-go@v5
-      with:
-        cache-dependency-path: |
-          go.mod
-          go.sum
-        go-version: '1.25'
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
 
-    - name: Generate and build
-      run: |
-        git submodule update --init
-        make GOFLAGS="-buildvcs=false" CC=clang
+      - name: Generate and build
+        run: |
+          git submodule update --init
+          make GOFLAGS="-buildvcs=false" CC=clang
 
-    - name: Store executable
-      uses: actions/upload-artifact@v4
-      with:
-        name: dae
-        path: dae
+      - name: Store executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: dae
+          path: dae
 
   test:
     runs-on: ubuntu-22.04

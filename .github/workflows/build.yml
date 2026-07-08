@@ -15,12 +15,15 @@ on:
   push:
     branches:
       - main
+      - legacy
     paths:
       - "**/*.go"
       - "**/*.c"
       - "**/*.h"
       - "go.mod"
       - "go.sum"
+      - "devenv.nix"
+      - "devenv.yaml"
       - ".github/workflows/build.yml"
       - ".github/workflows/seed-build.yml"
       - "Makefile"
@@ -36,7 +39,7 @@ jobs:
     secrets: inherit
 
   build:
-    uses: daeuniverse/dae/.github/workflows/seed-build.yml@main
+    uses: ./.github/workflows/seed-build.yml
     with:
       ref: ${{ github.sha }}
       build-type: main-build

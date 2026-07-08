@@ -57,6 +57,9 @@ jobs:
       fail-fast: false
 
     runs-on: ubuntu-22.04
+    defaults:
+      run:
+        shell: nix develop --impure . --command bash -e {0}
     env:
       GOOS: ${{ matrix.goos }}
       GOARCH: ${{ matrix.goarch }}
@@ -73,6 +76,7 @@ jobs:
 
       - name: Get the version
         id: get_version
+        shell: bash
         env:
           REF: ${{ inputs.ref }}
         run: |
@@ -90,24 +94,18 @@ jobs:
 
       - name: Show workflow information
         id: get_filename
+        shell: bash
         run: |
           export _NAME=$(jq ".[\"$GOOS-$GOARCH$GOARM$GOAMD64\"].friendlyName" -r < install/friendly-filenames.json)
           echo "GOOS: $GOOS, GOARCH: $GOARCH, RELEASE_NAME: $_NAME"
           echo "ASSET_NAME=$_NAME" >> $GITHUB_OUTPUT
           echo "ASSET_NAME=$_NAME" >> $GITHUB_ENV
 
-      - name: Set up Go
-        uses: actions/setup-go@v5
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
         with:
-          cache-dependency-path: |
-            go.mod
-            go.sum          
-          go-version: '1.25'
-
-      - name: Install Dependencies
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y clang-15 llvm-15
+          extra_nix_config: |
+            experimental-features = nix-command flakes
 
       - name: Get project dependencies
         run: |
@@ -122,8 +120,6 @@ jobs:
           export GOFLAGS="-trimpath -modcacherw"
           export OUTPUT=build/dae-$ASSET_NAME
           export VERSION=${{ steps.get_version.outputs.VERSION }}
-          export CLANG=clang-15
-          export STRIP=llvm-strip-15
           make
           cp ./install/dae.service ./build/
           cp ./example.dae ./build/
