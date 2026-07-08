@@ -108,10 +108,11 @@ func rewriteAndLoadBpf(ipVersion int, l4ProtoNo uint16, port int) (_ *bpfObjects
 		return nil, fmt.Errorf("failed to rewrite constants: %+v\n", err)
 	}
 	var opts ebpf.CollectionOptions
+	opts.Cache = internal.KernelBTFCache()
 	opts.Programs.LogLevel = ebpf.LogLevelInstruction
 	// Instruction-level verifier logs start higher and grow on demand.
 	opts.Programs.LogSizeStart = 8 << 20
-	kernelTypes, err := internal.LoadKernelSpec()
+	kernelTypes, err := opts.Cache.Kernel()
 	if err != nil {
 		return nil, fmt.Errorf("load kernel BTF: %w", err)
 	}

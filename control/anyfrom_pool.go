@@ -12,7 +12,6 @@ import (
 	"net"
 	"net/netip"
 	"os"
-	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -113,25 +112,10 @@ func (a *Anyfrom) WriteToUDPAddrPort(b []byte, addr netip.AddrPort) (n int, err 
 
 // isGSOSupported tests if the kernel supports GSO.
 // Sending with GSO might still fail later on, if the interface doesn't support it (see isGSOError).
-func isGSOSupported(uc *net.UDPConn) bool {
+func isGSOSupported(_ *net.UDPConn) bool {
 	// TODO: We disable GSO because we haven't thought through how to design to use larger packets (we assume the max size of packet is 1500).
 	// See https://github.com/daeuniverse/dae/blob/cab1e4290967340923d7d5ca52b80f781711c18e/control/control_plane.go#L721C37-L721C37.
 	return false
-	conn, err := uc.SyscallConn()
-	if err != nil {
-		return false
-	}
-	disabled, err := strconv.ParseBool(os.Getenv("DAE_DISABLE_GSO"))
-	if err == nil && disabled {
-		return false
-	}
-	var serr error
-	if err := conn.Control(func(fd uintptr) {
-		_, serr = unix.GetsockoptInt(int(fd), unix.IPPROTO_UDP, unix.UDP_SEGMENT)
-	}); err != nil {
-		return false
-	}
-	return serr == nil
 }
 func isGSOError(err error) bool {
 	var serr *os.SyscallError

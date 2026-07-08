@@ -227,10 +227,13 @@ func collectionOptionsWithKernelTypes(opts *ebpf.CollectionOptions) (*ebpf.Colle
 	if opts != nil {
 		loadOpts = *opts
 	}
+	if loadOpts.Cache == nil {
+		loadOpts.Cache = internal.KernelBTFCache()
+	}
 	if loadOpts.Programs.KernelTypes != nil {
 		return &loadOpts, nil
 	}
-	kernelTypes, err := internal.LoadKernelSpec()
+	kernelTypes, err := loadOpts.Cache.Kernel()
 	if err != nil {
 		return nil, fmt.Errorf("load kernel BTF: %w", err)
 	}

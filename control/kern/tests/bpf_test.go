@@ -52,13 +52,15 @@ func collectPrograms(t *testing.T) (progset []programSet, err error) {
 		return
 	}
 
-	kernelTypes, err := internal.LoadKernelSpec()
+	btfCache := internal.KernelBTFCache()
+	kernelTypes, err := btfCache.Kernel()
 	if err != nil {
 		return nil, fmt.Errorf("load kernel BTF: %w", err)
 	}
 
 	if err = loadBpftestObjects(obj,
 		&ebpf.CollectionOptions{
+			Cache: btfCache,
 			Maps: ebpf.MapOptions{
 				PinPath: pinPath,
 			},
