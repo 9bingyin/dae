@@ -32,6 +32,9 @@ import (
 const (
 	MaxDnsLookupDepth  = 3
 	minFirefoxCacheTtl = 120
+	// RFC 2308: negative answers without SOA use a sensible default; cap long SOA MINIMUMs.
+	defaultNegativeCacheTtl = 300
+	maxNegativeCacheTtl     = 3600
 )
 
 type IpVersionPrefer int
@@ -203,6 +206,7 @@ func (c *DnsController) importDnsCache(cacheKey string, fqdn string, cache *DnsC
 		return nil, err
 	}
 	newCache.CacheKey = cacheKey
+	newCache.Rcode = cache.Rcode
 
 	var oldCache *DnsCache
 	c.dnsCacheMu.Lock()
@@ -318,12 +322,36 @@ func (c *DnsController) NormalizeAndCacheDnsResp_(msg *dnsmessage.Msg) (err erro
 
 	q := msg.Question[0]
 
-	// Check suc resp.
-	if msg.Rcode != dnsmessage.RcodeSuccess {
+	switch msg.Rcode {
+	case dnsmessage.RcodeNameError:
+		// RFC 2308 NXDOMAIN negative cache.
+		ttl := negativeCacheTTL(msg)
+		if ttl <= 0 {
+			return nil
+		}
+		return c.updateDnsCache(msg, ttl, &q)
+	case dnsmessage.RcodeSuccess:
+		// continue
+	default:
+		// SERVFAIL/REFUSED/etc. are not cached.
 		return nil
 	}
 
-	// Get TTL.
+	// NODATA: NOERROR with no relevant answers (RFC 2308).
+	if !hasDnsAnswerData(msg) {
+		if !isCacheableNodata(msg) {
+			return nil
+		}
+		ttl := negativeCacheTTL(msg)
+		if ttl <= 0 {
+			return nil
+		}
+		// Keep client-facing answer empty; store as success negative cache.
+		msg.Answer = nil
+		return c.updateDnsCache(msg, ttl, &q)
+	}
+
+	// Positive answer TTL from first answer RR.
 	var ttl uint32
 	for i := range msg.Answer {
 		if ttl == 0 {
@@ -332,7 +360,6 @@ func (c *DnsController) NormalizeAndCacheDnsResp_(msg *dnsmessage.Msg) (err erro
 		}
 	}
 	if ttl == 0 {
-		// It seems no answers (NXDomain).
 		ttl = minFirefoxCacheTtl
 	}
 
@@ -340,65 +367,80 @@ func (c *DnsController) NormalizeAndCacheDnsResp_(msg *dnsmessage.Msg) (err erro
 	switch q.Qtype {
 	case dnsmessage.TypeA, dnsmessage.TypeAAAA:
 	default:
-		// Update DnsCache.
-		if err = c.updateDnsCache(msg, ttl, &q); err != nil {
-			return err
-		}
-		return nil
+		return c.updateDnsCache(msg, ttl, &q)
 	}
 
-	// Set ttl.
+	// Set ttl = zero for A/AAAA so applications resend every request.
 	for i := range msg.Answer {
-		// Set TTL = zero. This requests applications must resend every request.
-		// However, it may be not defined in the standard.
 		msg.Answer[i].Header().Ttl = 0
 	}
 
-	// Check if request A/AAAA record.
-	var reqIpRecord bool
-loop:
-	for i := range msg.Question {
-		switch msg.Question[i].Qtype {
-		case dnsmessage.TypeA, dnsmessage.TypeAAAA:
-			reqIpRecord = true
-			break loop
-		}
-	}
-	if !reqIpRecord {
-		// Update DnsCache.
-		if err = c.updateDnsCache(msg, ttl, &q); err != nil {
-			return err
-		}
-		return nil
-	}
-
-	// Update DnsCache.
-	if err = c.updateDnsCache(msg, ttl, &q); err != nil {
-		return err
-	}
-	// Pack to get newData.
-	return nil
+	return c.updateDnsCache(msg, ttl, &q)
 }
 
 func (c *DnsController) updateDnsCache(msg *dnsmessage.Msg, ttl uint32, q *dnsmessage.Question) error {
-	// Update DnsCache.
 	if c.log.IsLevelEnabled(logrus.TraceLevel) {
 		c.log.WithFields(logrus.Fields{
 			"_qname": q.Name,
 			"rcode":  msg.Rcode,
 			"ans":    FormatDnsRsc(msg.Answer),
+			"ttl":    ttl,
 		}).Tracef("Update DNS record cache")
 	}
 
-	if err := c.UpdateDnsCacheTtl(q.Name, q.Qtype, msg.Answer, int(ttl)); err != nil {
-		return err
+	return c.updateDnsCacheTtlRcode(q.Name, q.Qtype, msg.Answer, int(ttl), msg.Rcode)
+}
+
+// negativeCacheTTL implements a pragmatic RFC 2308 TTL:
+// min(SOA.TTL, SOA.MINIMUM) when SOA is present, else defaultNegativeCacheTtl,
+// always capped by maxNegativeCacheTtl.
+func negativeCacheTTL(msg *dnsmessage.Msg) uint32 {
+	ttl := uint32(defaultNegativeCacheTtl)
+	if soa := findSOA(msg); soa != nil {
+		ttl = soa.Hdr.Ttl
+		if soa.Minttl < ttl {
+			ttl = soa.Minttl
+		}
+	}
+	if ttl > maxNegativeCacheTtl {
+		ttl = maxNegativeCacheTtl
+	}
+	return ttl
+}
+
+func findSOA(msg *dnsmessage.Msg) *dnsmessage.SOA {
+	for _, rr := range msg.Ns {
+		if soa, ok := rr.(*dnsmessage.SOA); ok {
+			return soa
+		}
 	}
 	return nil
 }
 
+func hasDnsAnswerData(msg *dnsmessage.Msg) bool {
+	return len(msg.Answer) > 0
+}
+
+// isCacheableNodata distinguishes NODATA from bare referrals.
+// Cache when authority has SOA, or authority is empty (common forwarder NODATA).
+// Do not cache NOERROR with NS-only authority and no SOA (referral).
+func isCacheableNodata(msg *dnsmessage.Msg) bool {
+	if findSOA(msg) != nil {
+		return true
+	}
+	hasNS := false
+	for _, rr := range msg.Ns {
+		if _, ok := rr.(*dnsmessage.NS); ok {
+			hasNS = true
+			break
+		}
+	}
+	return !hasNS
+}
+
 type daedlineFunc func(now time.Time, host string) (deadline time.Time, originalDeadline time.Time)
 
-func (c *DnsController) __updateDnsCacheDeadline(host string, dnsTyp uint16, answers []dnsmessage.RR, deadlineFunc daedlineFunc) (err error) {
+func (c *DnsController) __updateDnsCacheDeadline(host string, dnsTyp uint16, answers []dnsmessage.RR, rcode int, deadlineFunc daedlineFunc) (err error) {
 	var fqdn string
 	if strings.HasSuffix(host, ".") {
 		fqdn = strings.ToLower(host)
@@ -425,6 +467,7 @@ func (c *DnsController) __updateDnsCacheDeadline(host string, dnsTyp uint16, ans
 		return err
 	}
 	newCache.CacheKey = cacheKey
+	newCache.Rcode = rcode
 
 	c.dnsCacheMu.Lock()
 	oldLive, hadOld := c.dnsCache[cacheKey]
@@ -455,7 +498,7 @@ func (c *DnsController) __updateDnsCacheDeadline(host string, dnsTyp uint16, ans
 }
 
 func (c *DnsController) UpdateDnsCacheDeadline(host string, dnsTyp uint16, answers []dnsmessage.RR, deadline time.Time) (err error) {
-	return c.__updateDnsCacheDeadline(host, dnsTyp, answers, func(now time.Time, host string) (daedline time.Time, originalDeadline time.Time) {
+	return c.__updateDnsCacheDeadline(host, dnsTyp, answers, dnsmessage.RcodeSuccess, func(now time.Time, host string) (daedline time.Time, originalDeadline time.Time) {
 		if fixedTtl, ok := c.fixedDomainTtl[host]; ok {
 			/// NOTICE: Cannot set TTL accurately.
 			if now.Sub(deadline).Seconds() > float64(fixedTtl) {
@@ -468,13 +511,16 @@ func (c *DnsController) UpdateDnsCacheDeadline(host string, dnsTyp uint16, answe
 }
 
 func (c *DnsController) UpdateDnsCacheTtl(host string, dnsTyp uint16, answers []dnsmessage.RR, ttl int) (err error) {
-	return c.__updateDnsCacheDeadline(host, dnsTyp, answers, func(now time.Time, host string) (daedline time.Time, originalDeadline time.Time) {
+	return c.updateDnsCacheTtlRcode(host, dnsTyp, answers, ttl, dnsmessage.RcodeSuccess)
+}
+
+func (c *DnsController) updateDnsCacheTtlRcode(host string, dnsTyp uint16, answers []dnsmessage.RR, ttl int, rcode int) (err error) {
+	return c.__updateDnsCacheDeadline(host, dnsTyp, answers, rcode, func(now time.Time, host string) (daedline time.Time, originalDeadline time.Time) {
 		originalDeadline = now.Add(time.Duration(ttl) * time.Second)
 		if fixedTtl, ok := c.fixedDomainTtl[host]; ok {
 			return now.Add(time.Duration(fixedTtl) * time.Second), originalDeadline
-		} else {
-			return originalDeadline, originalDeadline
 		}
+		return originalDeadline, originalDeadline
 	})
 }
 

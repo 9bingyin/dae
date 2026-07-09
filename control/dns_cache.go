@@ -17,16 +17,32 @@ type DnsCache struct {
 	CacheKey         string
 	DomainBitmap     []uint32
 	Answer           []dnsmessage.RR
+	Rcode            int // DNS RCODE; 0 (RcodeSuccess) for positive/NODATA answers.
 	Deadline         time.Time
 	OriginalDeadline time.Time // This field is not impacted by `fixed_domain_ttl`.
 }
 
 func (c *DnsCache) FillInto(req *dnsmessage.Msg) {
-	req.Answer = deepcopy.Copy(c.Answer).([]dnsmessage.RR)
-	req.Rcode = dnsmessage.RcodeSuccess
+	if c.Answer != nil {
+		req.Answer = deepcopy.Copy(c.Answer).([]dnsmessage.RR)
+	} else {
+		req.Answer = nil
+	}
+	req.Rcode = c.Rcode
 	req.Response = true
 	req.RecursionAvailable = true
 	req.Truncated = false
+}
+
+// IsNegative reports NXDOMAIN or NODATA-style empty success answers.
+func (c *DnsCache) IsNegative() bool {
+	if c == nil {
+		return false
+	}
+	if c.Rcode == dnsmessage.RcodeNameError {
+		return true
+	}
+	return c.Rcode == dnsmessage.RcodeSuccess && !c.IncludeAnyIp() && len(c.Answer) == 0
 }
 
 func (c *DnsCache) IncludeIp(ip netip.Addr) bool {
