@@ -45,9 +45,9 @@ type controlPlaneCore struct {
 	isReload   bool
 	bpfEjected bool
 
-	domainRefs           map[netip.Addr]map[string][]uint32
-	domainMapMu          sync.Mutex
-	domainRoutingFrozen  bool
+	domainRefs          map[netip.Addr]map[string][]uint32
+	domainMapMu         sync.Mutex
+	domainRoutingFrozen bool
 
 	closed context.Context
 	close  context.CancelFunc
