@@ -683,8 +683,8 @@ func (c *ControlPlane) ChooseDialTarget(outbound consts.OutboundIndex, dst netip
 	if !outbound.IsReserved() && domain != "" {
 		switch c.dialMode {
 		case consts.DialMode_Domain:
-			if cache := c.dnsController.LookupDnsRespCache(c.dnsController.cacheKey(domain, common.AddrToDnsType(dst.Addr())), true); cache != nil {
-				// Has A/AAAA records. It is a real domain.
+			if cache := c.dnsController.LookupDnsRespCache(c.dnsController.cacheKey(domain, common.AddrToDnsType(dst.Addr())), true); cache != nil && cache.IncludeAnyIp() {
+				// Positive A/AAAA cache: treat as a real domain.
 				dialMode = consts.DialMode_Domain
 			} else {
 				// Check if the domain is in real-domain set (bloom filter).

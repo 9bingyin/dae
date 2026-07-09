@@ -14,28 +14,12 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-func TestNormalizeAndCacheNxdomain(t *testing.T) {
+func TestNormalizeAndCacheNxdomainWithSOA(t *testing.T) {
 	controller := newNegativeCacheController(t)
 	msg := newDNSMsg("missing.example.", dnsmessage.TypeA)
 	msg.Response = true
 	msg.Rcode = dnsmessage.RcodeNameError
-	msg.Ns = []dnsmessage.RR{
-		&dnsmessage.SOA{
-			Hdr: dnsmessage.RR_Header{
-				Name:   "example.",
-				Rrtype: dnsmessage.TypeSOA,
-				Class:  dnsmessage.ClassINET,
-				Ttl:    600,
-			},
-			Ns:      "ns.example.",
-			Mbox:    "hostmaster.example.",
-			Serial:  1,
-			Refresh: 1,
-			Retry:   1,
-			Expire:  1,
-			Minttl:  120,
-		},
-	}
+	msg.Ns = []dnsmessage.RR{testSOA(600, 120)}
 
 	if err := controller.NormalizeAndCacheDnsResp_(msg); err != nil {
 		t.Fatalf("normalize: %v", err)
@@ -44,15 +28,15 @@ func TestNormalizeAndCacheNxdomain(t *testing.T) {
 	cacheKey := controller.cacheKey("missing.example.", dnsmessage.TypeA)
 	cache := controller.LookupDnsRespCache(cacheKey, false)
 	if cache == nil {
-		t.Fatal("NXDOMAIN should be cached")
+		t.Fatal("NXDOMAIN with SOA should be cached")
 	}
 	if cache.Rcode != dnsmessage.RcodeNameError {
 		t.Fatalf("rcode: got %d, want NXDOMAIN", cache.Rcode)
 	}
-	if cache.IncludeAnyIp() {
-		t.Fatal("NXDOMAIN cache must not carry IPs")
+	if cache.IncludeAnyIp() || len(cache.Answer) != 0 {
+		t.Fatal("NXDOMAIN cache must not carry answers/IPs")
 	}
-	// TTL = min(SOA.TTL=600, SOA.MINIMUM=120) = 120
+	// TTL = min(600, 120) = 120
 	remain := time.Until(cache.Deadline)
 	if remain < 100*time.Second || remain > 120*time.Second {
 		t.Fatalf("unexpected remaining TTL: %v", remain)
@@ -63,17 +47,29 @@ func TestNormalizeAndCacheNxdomain(t *testing.T) {
 	if out.Rcode != dnsmessage.RcodeNameError {
 		t.Fatalf("FillInto rcode: got %d, want NXDOMAIN", out.Rcode)
 	}
-	if len(out.Answer) != 0 {
-		t.Fatalf("FillInto answer should be empty, got %d", len(out.Answer))
+}
+
+func TestNormalizeAndCacheNxdomainWithoutSOA(t *testing.T) {
+	controller := newNegativeCacheController(t)
+	msg := newDNSMsg("missing.example.", dnsmessage.TypeA)
+	msg.Response = true
+	msg.Rcode = dnsmessage.RcodeNameError
+
+	if err := controller.NormalizeAndCacheDnsResp_(msg); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	cacheKey := controller.cacheKey("missing.example.", dnsmessage.TypeA)
+	if cache := controller.LookupDnsRespCache(cacheKey, false); cache != nil {
+		t.Fatal("NXDOMAIN without SOA must not be cached")
 	}
 }
 
-func TestNormalizeAndCacheNodataDefaultTTL(t *testing.T) {
+func TestNormalizeAndCacheNodataWithSOA(t *testing.T) {
 	controller := newNegativeCacheController(t)
 	msg := newDNSMsg("empty.example.", dnsmessage.TypeAAAA)
 	msg.Response = true
 	msg.Rcode = dnsmessage.RcodeSuccess
-	// Empty answer + empty authority → cacheable NODATA with default TTL.
+	msg.Ns = []dnsmessage.RR{testSOA(300, 180)}
 
 	if err := controller.NormalizeAndCacheDnsResp_(msg); err != nil {
 		t.Fatalf("normalize: %v", err)
@@ -82,7 +78,7 @@ func TestNormalizeAndCacheNodataDefaultTTL(t *testing.T) {
 	cacheKey := controller.cacheKey("empty.example.", dnsmessage.TypeAAAA)
 	cache := controller.LookupDnsRespCache(cacheKey, false)
 	if cache == nil {
-		t.Fatal("NODATA should be cached")
+		t.Fatal("NODATA with SOA should be cached")
 	}
 	if cache.Rcode != dnsmessage.RcodeSuccess {
 		t.Fatalf("rcode: got %d, want NOERROR", cache.Rcode)
@@ -90,9 +86,25 @@ func TestNormalizeAndCacheNodataDefaultTTL(t *testing.T) {
 	if !cache.IsNegative() {
 		t.Fatal("expected negative cache entry")
 	}
+	// TTL = min(300, 180) = 180
 	remain := time.Until(cache.Deadline)
-	if remain < 280*time.Second || remain > 300*time.Second {
-		t.Fatalf("expected default negative TTL ~300s, got %v", remain)
+	if remain < 160*time.Second || remain > 180*time.Second {
+		t.Fatalf("unexpected remaining TTL: %v", remain)
+	}
+}
+
+func TestNormalizeAndCacheNodataWithoutSOA(t *testing.T) {
+	controller := newNegativeCacheController(t)
+	msg := newDNSMsg("empty.example.", dnsmessage.TypeAAAA)
+	msg.Response = true
+	msg.Rcode = dnsmessage.RcodeSuccess
+
+	if err := controller.NormalizeAndCacheDnsResp_(msg); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	cacheKey := controller.cacheKey("empty.example.", dnsmessage.TypeAAAA)
+	if cache := controller.LookupDnsRespCache(cacheKey, false); cache != nil {
+		t.Fatal("NODATA without SOA must not be cached")
 	}
 }
 
@@ -127,6 +139,7 @@ func TestNormalizeAndCacheSkipsServfail(t *testing.T) {
 	msg := newDNSMsg("fail.example.", dnsmessage.TypeA)
 	msg.Response = true
 	msg.Rcode = dnsmessage.RcodeServerFailure
+	msg.Ns = []dnsmessage.RR{testSOA(300, 300)}
 
 	if err := controller.NormalizeAndCacheDnsResp_(msg); err != nil {
 		t.Fatalf("normalize: %v", err)
@@ -134,6 +147,70 @@ func TestNormalizeAndCacheSkipsServfail(t *testing.T) {
 	cacheKey := controller.cacheKey("fail.example.", dnsmessage.TypeA)
 	if cache := controller.LookupDnsRespCache(cacheKey, false); cache != nil {
 		t.Fatal("SERVFAIL must not be cached")
+	}
+}
+
+func TestNormalizeAndCacheSkipsTruncated(t *testing.T) {
+	controller := newNegativeCacheController(t)
+	msg := newDNSMsg("tc.example.", dnsmessage.TypeA)
+	msg.Response = true
+	msg.Truncated = true
+	msg.Rcode = dnsmessage.RcodeNameError
+	msg.Ns = []dnsmessage.RR{testSOA(300, 300)}
+
+	if err := controller.NormalizeAndCacheDnsResp_(msg); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	cacheKey := controller.cacheKey("tc.example.", dnsmessage.TypeA)
+	if cache := controller.LookupDnsRespCache(cacheKey, false); cache != nil {
+		t.Fatal("truncated response must not be cached")
+	}
+}
+
+func TestNormalizeAndCacheNxdomainStripsDirtyAnswer(t *testing.T) {
+	var lastNew *DnsCache
+	controller, err := NewDnsController(nil, &DnsControllerOption{
+		Log: logrus.New(),
+		NewCache: func(_ string, answers []dnsmessage.RR, deadline time.Time, originalDeadline time.Time) (*DnsCache, error) {
+			return &DnsCache{
+				DomainBitmap:     testDomainBitmap(0),
+				Answer:           answers,
+				Deadline:         deadline,
+				OriginalDeadline: originalDeadline,
+			}, nil
+		},
+		CacheUpdateCallback: func(oldCache, newCache *DnsCache) error {
+			lastNew = cloneDnsCache(newCache)
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewDnsController: %v", err)
+	}
+
+	msg := newDNSMsg("dirty.example.", dnsmessage.TypeA)
+	msg.Response = true
+	msg.Rcode = dnsmessage.RcodeNameError
+	msg.Ns = []dnsmessage.RR{testSOA(300, 300)}
+	msg.Answer = []dnsmessage.RR{
+		&dnsmessage.A{
+			Hdr: dnsmessage.RR_Header{
+				Name:   "dirty.example.",
+				Rrtype: dnsmessage.TypeA,
+				Class:  dnsmessage.ClassINET,
+				Ttl:    60,
+			},
+			A: net.ParseIP("192.0.2.99").To4(),
+		},
+	}
+	if err := controller.NormalizeAndCacheDnsResp_(msg); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if lastNew == nil {
+		t.Fatal("expected cache update")
+	}
+	if lastNew.IncludeAnyIp() || len(domainCacheIPs(lastNew)) != 0 {
+		t.Fatal("NXDOMAIN must not install A/AAAA into domain maps")
 	}
 }
 
@@ -159,7 +236,6 @@ func TestNegativeCacheReplacesPositiveAndClearsDomainIPs(t *testing.T) {
 		t.Fatalf("NewDnsController: %v", err)
 	}
 
-	// Seed positive A answer.
 	pos := newDNSMsg("host.example.", dnsmessage.TypeA)
 	pos.Response = true
 	pos.Rcode = dnsmessage.RcodeSuccess
@@ -181,10 +257,10 @@ func TestNegativeCacheReplacesPositiveAndClearsDomainIPs(t *testing.T) {
 		t.Fatal("positive update should include IP")
 	}
 
-	// Replace with NXDOMAIN.
 	neg := newDNSMsg("host.example.", dnsmessage.TypeA)
 	neg.Response = true
 	neg.Rcode = dnsmessage.RcodeNameError
+	neg.Ns = []dnsmessage.RR{testSOA(300, 300)}
 	if err := controller.NormalizeAndCacheDnsResp_(neg); err != nil {
 		t.Fatalf("negative normalize: %v", err)
 	}
@@ -197,8 +273,6 @@ func TestNegativeCacheReplacesPositiveAndClearsDomainIPs(t *testing.T) {
 	if lastNew.Rcode != dnsmessage.RcodeNameError {
 		t.Fatalf("new rcode: got %d", lastNew.Rcode)
 	}
-
-	// domainCacheIPs on negative must be empty so ReplaceDomain only removes.
 	if ips := domainCacheIPs(lastNew); len(ips) != 0 {
 		t.Fatalf("domainCacheIPs(negative)=%v, want empty", ips)
 	}
@@ -208,19 +282,140 @@ func TestNegativeCacheTTLCapped(t *testing.T) {
 	msg := newDNSMsg("long.example.", dnsmessage.TypeA)
 	msg.Response = true
 	msg.Rcode = dnsmessage.RcodeNameError
-	msg.Ns = []dnsmessage.RR{
-		&dnsmessage.SOA{
+	msg.Ns = []dnsmessage.RR{testSOA(86400, 86400)}
+	ttl, ok := negativeCacheTTL(msg)
+	if !ok {
+		t.Fatal("expected cacheable")
+	}
+	if ttl != maxNegativeCacheTtl {
+		t.Fatalf("ttl: got %d, want cap %d", ttl, maxNegativeCacheTtl)
+	}
+}
+
+func TestNegativeCacheIgnoresFixedDomainTtlExtension(t *testing.T) {
+	controller, err := NewDnsController(nil, &DnsControllerOption{
+		Log: logrus.New(),
+		FixedDomainTtl: map[string]int{
+			"fixed.example": 86400,
+		},
+		NewCache: func(_ string, answers []dnsmessage.RR, deadline time.Time, originalDeadline time.Time) (*DnsCache, error) {
+			return &DnsCache{
+				DomainBitmap:     testDomainBitmap(0),
+				Answer:           answers,
+				Deadline:         deadline,
+				OriginalDeadline: originalDeadline,
+			}, nil
+		},
+		CacheUpdateCallback: func(oldCache, newCache *DnsCache) error { return nil },
+	})
+	if err != nil {
+		t.Fatalf("NewDnsController: %v", err)
+	}
+
+	msg := newDNSMsg("fixed.example.", dnsmessage.TypeA)
+	msg.Response = true
+	msg.Rcode = dnsmessage.RcodeNameError
+	msg.Ns = []dnsmessage.RR{testSOA(300, 120)}
+	if err := controller.NormalizeAndCacheDnsResp_(msg); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+
+	cache := controller.LookupDnsRespCache(controller.cacheKey("fixed.example.", dnsmessage.TypeA), false)
+	if cache == nil {
+		t.Fatal("expected cached NXDOMAIN")
+	}
+	remain := time.Until(cache.Deadline)
+	// Must follow SOA TTL 120, not fixed 86400.
+	if remain < 100*time.Second || remain > 120*time.Second {
+		t.Fatalf("fixed_domain_ttl must not extend negative cache, remain=%v", remain)
+	}
+}
+
+func TestNegativeCacheFixedZeroSkips(t *testing.T) {
+	controller, err := NewDnsController(nil, &DnsControllerOption{
+		Log: logrus.New(),
+		FixedDomainTtl: map[string]int{
+			"nocache.example": 0,
+		},
+		NewCache: func(_ string, answers []dnsmessage.RR, deadline time.Time, originalDeadline time.Time) (*DnsCache, error) {
+			return &DnsCache{
+				DomainBitmap:     testDomainBitmap(0),
+				Answer:           answers,
+				Deadline:         deadline,
+				OriginalDeadline: originalDeadline,
+			}, nil
+		},
+		CacheUpdateCallback: func(oldCache, newCache *DnsCache) error { return nil },
+	})
+	if err != nil {
+		t.Fatalf("NewDnsController: %v", err)
+	}
+
+	msg := newDNSMsg("nocache.example.", dnsmessage.TypeA)
+	msg.Response = true
+	msg.Rcode = dnsmessage.RcodeNameError
+	msg.Ns = []dnsmessage.RR{testSOA(300, 300)}
+	if err := controller.NormalizeAndCacheDnsResp_(msg); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if cache := controller.LookupDnsRespCache(controller.cacheKey("nocache.example.", dnsmessage.TypeA), false); cache != nil {
+		t.Fatal("fixed_domain_ttl=0 must skip negative cache")
+	}
+}
+
+func TestImportDnsCachePreservesNxdomainRcode(t *testing.T) {
+	controller := newNegativeCacheController(t)
+	cacheKey := controller.cacheKey("import.example.", dnsmessage.TypeA)
+	deadline := time.Now().Add(2 * time.Minute)
+	imported, err := controller.ImportDnsCache(map[string]*DnsCache{
+		cacheKey: {
+			CacheKey:         cacheKey,
+			DomainBitmap:     testDomainBitmap(0),
+			Rcode:            dnsmessage.RcodeNameError,
+			Deadline:         deadline,
+			OriginalDeadline: deadline,
+		},
+	})
+	if err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	if len(imported) != 1 {
+		t.Fatalf("imported count: %d", len(imported))
+	}
+	cache := controller.LookupDnsRespCache(cacheKey, false)
+	if cache == nil || cache.Rcode != dnsmessage.RcodeNameError {
+		t.Fatalf("imported NXDOMAIN rcode not preserved: %+v", cache)
+	}
+}
+
+func TestCnameOnlyIsNotNodata(t *testing.T) {
+	controller := newNegativeCacheController(t)
+	msg := newDNSMsg("cname.example.", dnsmessage.TypeA)
+	msg.Response = true
+	msg.Rcode = dnsmessage.RcodeSuccess
+	msg.Answer = []dnsmessage.RR{
+		&dnsmessage.CNAME{
 			Hdr: dnsmessage.RR_Header{
-				Name:   "example.",
-				Rrtype: dnsmessage.TypeSOA,
+				Name:   "cname.example.",
+				Rrtype: dnsmessage.TypeCNAME,
 				Class:  dnsmessage.ClassINET,
-				Ttl:    86400,
+				Ttl:    60,
 			},
-			Minttl: 86400,
+			Target: "target.example.",
 		},
 	}
-	if got := negativeCacheTTL(msg); got != maxNegativeCacheTtl {
-		t.Fatalf("ttl: got %d, want cap %d", got, maxNegativeCacheTtl)
+	if err := controller.NormalizeAndCacheDnsResp_(msg); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	cache := controller.LookupDnsRespCache(controller.cacheKey("cname.example.", dnsmessage.TypeA), false)
+	if cache == nil {
+		t.Fatal("CNAME-only success should be cached as positive-path entry")
+	}
+	if cache.IsNegative() {
+		t.Fatal("CNAME-only must not be classified as negative")
+	}
+	if len(cache.Answer) != 1 {
+		t.Fatalf("expected CNAME preserved, got %d answers", len(cache.Answer))
 	}
 }
 
@@ -252,5 +447,19 @@ func newDNSMsg(name string, qtype uint16) *dnsmessage.Msg {
 			Qtype:  qtype,
 			Qclass: dnsmessage.ClassINET,
 		}},
+	}
+}
+
+func testSOA(ttl, minttl uint32) *dnsmessage.SOA {
+	return &dnsmessage.SOA{
+		Hdr: dnsmessage.RR_Header{
+			Name:   "example.",
+			Rrtype: dnsmessage.TypeSOA,
+			Class:  dnsmessage.ClassINET,
+			Ttl:    ttl,
+		},
+		Ns:     "ns.example.",
+		Mbox:   "hostmaster.example.",
+		Minttl: minttl,
 	}
 }

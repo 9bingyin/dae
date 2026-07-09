@@ -32,9 +32,8 @@ import (
 const (
 	MaxDnsLookupDepth  = 3
 	minFirefoxCacheTtl = 120
-	// RFC 2308: negative answers without SOA use a sensible default; cap long SOA MINIMUMs.
-	defaultNegativeCacheTtl = 300
-	maxNegativeCacheTtl     = 3600
+	// RFC 2308: cap long SOA-derived negative TTLs.
+	maxNegativeCacheTtl = 3600
 )
 
 type IpVersionPrefer int
@@ -319,16 +318,21 @@ func (c *DnsController) NormalizeAndCacheDnsResp_(msg *dnsmessage.Msg) (err erro
 	if !msg.Response || len(msg.Question) == 0 {
 		return nil
 	}
+	// Incomplete UDP responses must not be cached (no TCP retry path here).
+	if msg.Truncated {
+		return nil
+	}
 
 	q := msg.Question[0]
 
 	switch msg.Rcode {
 	case dnsmessage.RcodeNameError:
-		// RFC 2308 NXDOMAIN negative cache.
-		ttl := negativeCacheTTL(msg)
-		if ttl <= 0 {
+		// RFC 2308 NXDOMAIN: require SOA; strip answers so domain maps never see IPs.
+		ttl, ok := negativeCacheTTL(msg)
+		if !ok {
 			return nil
 		}
+		msg.Answer = nil
 		return c.updateDnsCache(msg, ttl, &q)
 	case dnsmessage.RcodeSuccess:
 		// continue
@@ -337,16 +341,12 @@ func (c *DnsController) NormalizeAndCacheDnsResp_(msg *dnsmessage.Msg) (err erro
 		return nil
 	}
 
-	// NODATA: NOERROR with no relevant answers (RFC 2308).
-	if !hasDnsAnswerData(msg) {
-		if !isCacheableNodata(msg) {
+	// NODATA: NOERROR with empty answer and SOA in authority (RFC 2308).
+	if len(msg.Answer) == 0 {
+		ttl, ok := negativeCacheTTL(msg)
+		if !ok {
 			return nil
 		}
-		ttl := negativeCacheTTL(msg)
-		if ttl <= 0 {
-			return nil
-		}
-		// Keep client-facing answer empty; store as success negative cache.
 		msg.Answer = nil
 		return c.updateDnsCache(msg, ttl, &q)
 	}
@@ -354,10 +354,8 @@ func (c *DnsController) NormalizeAndCacheDnsResp_(msg *dnsmessage.Msg) (err erro
 	// Positive answer TTL from first answer RR.
 	var ttl uint32
 	for i := range msg.Answer {
-		if ttl == 0 {
-			ttl = msg.Answer[i].Header().Ttl
-			break
-		}
+		ttl = msg.Answer[i].Header().Ttl
+		break
 	}
 	if ttl == 0 {
 		ttl = minFirefoxCacheTtl
@@ -391,21 +389,25 @@ func (c *DnsController) updateDnsCache(msg *dnsmessage.Msg, ttl uint32, q *dnsme
 	return c.updateDnsCacheTtlRcode(q.Name, q.Qtype, msg.Answer, int(ttl), msg.Rcode)
 }
 
-// negativeCacheTTL implements a pragmatic RFC 2308 TTL:
-// min(SOA.TTL, SOA.MINIMUM) when SOA is present, else defaultNegativeCacheTtl,
-// always capped by maxNegativeCacheTtl.
-func negativeCacheTTL(msg *dnsmessage.Msg) uint32 {
-	ttl := uint32(defaultNegativeCacheTtl)
-	if soa := findSOA(msg); soa != nil {
-		ttl = soa.Hdr.Ttl
-		if soa.Minttl < ttl {
-			ttl = soa.Minttl
-		}
+// negativeCacheTTL returns TTL and whether the negative answer is cacheable.
+// RFC 2308: without SOA, negative answers SHOULD NOT be cached.
+// With SOA: TTL = min(SOA.TTL, SOA.MINIMUM), capped by maxNegativeCacheTtl.
+func negativeCacheTTL(msg *dnsmessage.Msg) (ttl uint32, ok bool) {
+	soa := findSOA(msg)
+	if soa == nil {
+		return 0, false
+	}
+	ttl = soa.Hdr.Ttl
+	if soa.Minttl < ttl {
+		ttl = soa.Minttl
+	}
+	if ttl == 0 {
+		return 0, false
 	}
 	if ttl > maxNegativeCacheTtl {
 		ttl = maxNegativeCacheTtl
 	}
-	return ttl
+	return ttl, true
 }
 
 func findSOA(msg *dnsmessage.Msg) *dnsmessage.SOA {
@@ -417,25 +419,11 @@ func findSOA(msg *dnsmessage.Msg) *dnsmessage.SOA {
 	return nil
 }
 
-func hasDnsAnswerData(msg *dnsmessage.Msg) bool {
-	return len(msg.Answer) > 0
-}
-
-// isCacheableNodata distinguishes NODATA from bare referrals.
-// Cache when authority has SOA, or authority is empty (common forwarder NODATA).
-// Do not cache NOERROR with NS-only authority and no SOA (referral).
-func isCacheableNodata(msg *dnsmessage.Msg) bool {
-	if findSOA(msg) != nil {
+func dnsCacheIsNegative(rcode int, answers []dnsmessage.RR) bool {
+	if rcode == dnsmessage.RcodeNameError {
 		return true
 	}
-	hasNS := false
-	for _, rr := range msg.Ns {
-		if _, ok := rr.(*dnsmessage.NS); ok {
-			hasNS = true
-			break
-		}
-	}
-	return !hasNS
+	return rcode == dnsmessage.RcodeSuccess && len(answers) == 0
 }
 
 type daedlineFunc func(now time.Time, host string) (deadline time.Time, originalDeadline time.Time)
@@ -451,6 +439,13 @@ func (c *DnsController) __updateDnsCacheDeadline(host string, dnsTyp uint16, ans
 	// Bypass pure IP.
 	if _, err = netip.ParseAddr(host); err == nil {
 		return nil
+	}
+
+	// fixed_domain_ttl=0 means do not cache; apply to negative answers too.
+	if dnsCacheIsNegative(rcode, answers) {
+		if fixedTtl, ok := c.fixedDomainTtl[host]; ok && fixedTtl == 0 {
+			return nil
+		}
 	}
 
 	now := time.Now()
@@ -515,8 +510,13 @@ func (c *DnsController) UpdateDnsCacheTtl(host string, dnsTyp uint16, answers []
 }
 
 func (c *DnsController) updateDnsCacheTtlRcode(host string, dnsTyp uint16, answers []dnsmessage.RR, ttl int, rcode int) (err error) {
+	negative := dnsCacheIsNegative(rcode, answers)
 	return c.__updateDnsCacheDeadline(host, dnsTyp, answers, rcode, func(now time.Time, host string) (daedline time.Time, originalDeadline time.Time) {
 		originalDeadline = now.Add(time.Duration(ttl) * time.Second)
+		// Negative answers must not be extended by fixed_domain_ttl.
+		if negative {
+			return originalDeadline, originalDeadline
+		}
 		if fixedTtl, ok := c.fixedDomainTtl[host]; ok {
 			return now.Add(time.Duration(fixedTtl) * time.Second), originalDeadline
 		}
@@ -841,7 +841,8 @@ func (c *DnsController) dialSend(invokingDepth int, req *udpRequest, data []byte
 			}).Traceln("Accept")
 		}
 	case consts.DnsResponseOutboundIndex_Reject:
-		// Reject the request with empty answer.
+		// Policy reject: empty answer, drop any prior positive cache/domain mapping.
+		// Do not treat this as NODATA negative cache.
 		respMsg.Answer = nil
 		if c.log.IsLevelEnabled(logrus.TraceLevel) {
 			c.log.WithFields(logrus.Fields{
@@ -849,7 +850,31 @@ func (c *DnsController) dialSend(invokingDepth int, req *udpRequest, data []byte
 				"upstream": upstreamName,
 			}).Traceln("Reject with empty answer")
 		}
-		// We also cache response reject.
+		var qname, qtype string
+		if len(respMsg.Question) > 0 {
+			q := respMsg.Question[0]
+			qname = strings.ToLower(q.Name)
+			qtype = QtypeToString(q.Qtype)
+			c.RemoveDnsRespCache(c.cacheKey(dnsmessage.CanonicalName(q.Name), q.Qtype))
+		}
+		if c.log.IsLevelEnabled(logrus.InfoLevel) {
+			c.log.WithFields(logrus.Fields{
+				"network":  networkType.String(),
+				"outbound": dialArgument.bestOutbound.Name,
+				"policy":   dialArgument.bestOutbound.GetSelectionPolicy(),
+				"dialer":   dialArgument.bestDialer.Property().Name,
+				"_qname":   qname,
+				"qtype":    qtype,
+				"pid":      req.routingResult.Pid,
+				"dscp":     req.routingResult.Dscp,
+				"pname":    ProcessName2String(req.routingResult.Pname[:]),
+				"mac":      Mac2String(req.routingResult.Mac[:]),
+			}).Infof("%v -> reject", RefineSourceToShow(req.realSrc, req.realDst.Addr()))
+		}
+		if needResp {
+			return writeDNSResponse(c.log, respMsg, id, req, responseWriter)
+		}
+		return nil
 	default:
 		if c.log.IsLevelEnabled(logrus.TraceLevel) {
 			c.log.WithFields(logrus.Fields{
@@ -860,17 +885,15 @@ func (c *DnsController) dialSend(invokingDepth int, req *udpRequest, data []byte
 		}
 		return c.dialSend(invokingDepth+1, req, data, id, nextUpstream, needResp, responseWriter)
 	}
-	if upstreamIndex.IsReserved() && c.log.IsLevelEnabled(logrus.InfoLevel) {
-		var (
-			qname string
-			qtype string
-		)
+	// Accept path: log, cache, and optionally respond.
+	if c.log.IsLevelEnabled(logrus.InfoLevel) {
+		var qname, qtype string
 		if len(respMsg.Question) > 0 {
 			q := respMsg.Question[0]
 			qname = strings.ToLower(q.Name)
 			qtype = QtypeToString(q.Qtype)
 		}
-		fields := logrus.Fields{
+		c.log.WithFields(logrus.Fields{
 			"network":  networkType.String(),
 			"outbound": dialArgument.bestOutbound.Name,
 			"policy":   dialArgument.bestOutbound.GetSelectionPolicy(),
@@ -881,15 +904,7 @@ func (c *DnsController) dialSend(invokingDepth int, req *udpRequest, data []byte
 			"dscp":     req.routingResult.Dscp,
 			"pname":    ProcessName2String(req.routingResult.Pname[:]),
 			"mac":      Mac2String(req.routingResult.Mac[:]),
-		}
-		switch upstreamIndex {
-		case consts.DnsResponseOutboundIndex_Accept:
-			c.log.WithFields(fields).Infof("%v <-> %v", RefineSourceToShow(req.realSrc, req.realDst.Addr()), RefineAddrPortToShow(dialArgument.bestTarget))
-		case consts.DnsResponseOutboundIndex_Reject:
-			c.log.WithFields(fields).Infof("%v -> reject", RefineSourceToShow(req.realSrc, req.realDst.Addr()))
-		default:
-			return fmt.Errorf("unknown upstream: %v", upstreamIndex.String())
-		}
+		}).Infof("%v <-> %v", RefineSourceToShow(req.realSrc, req.realDst.Addr()), RefineAddrPortToShow(dialArgument.bestTarget))
 	}
 	if err = c.NormalizeAndCacheDnsResp_(respMsg); err != nil {
 		return err
