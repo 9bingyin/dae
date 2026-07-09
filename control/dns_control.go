@@ -253,14 +253,17 @@ func cloneDnsCache(cache *DnsCache) *DnsCache {
 	}
 	cloned := *cache
 	cloned.DomainBitmap = slices.Clone(cache.DomainBitmap)
-	cloned.Answer = slices.Clone(cache.Answer)
+	if cache.Answer != nil {
+		cloned.Answer = deepcopy.Copy(cache.Answer).([]dnsmessage.RR)
+	}
 	return &cloned
 }
+
 func (c *DnsController) LookupDnsRespCache(cacheKey string, ignoreFixedTtl bool) (cache *DnsCache) {
 	c.dnsCacheMu.Lock()
 	cache, ok := c.dnsCache[cacheKey]
-	c.dnsCacheMu.Unlock()
 	if !ok {
+		c.dnsCacheMu.Unlock()
 		return nil
 	}
 	var deadline time.Time
@@ -272,19 +275,22 @@ func (c *DnsController) LookupDnsRespCache(cacheKey string, ignoreFixedTtl bool)
 	// We should make sure the cache did not expire, or
 	// return nil and request a new lookup to refresh the cache.
 	if !deadline.After(time.Now()) {
-		cache, ok := c.removeDnsRespCache(cacheKey, cache)
-		if ok {
-			if err := c.cacheRemoveCallback(cache); err != nil {
-				c.log.Warnf("failed to remove expired DNS cache mapping: %v", err)
-			}
+		delete(c.dnsCache, cacheKey)
+		removed := cloneDnsCache(cache)
+		c.dnsCacheMu.Unlock()
+		if err := c.cacheRemoveCallback(removed); err != nil {
+			c.log.Warnf("failed to remove expired DNS cache mapping: %v", err)
 		}
 		return nil
 	}
-	if err := c.cacheAccessCallback(cache); err != nil {
+	// Return a snapshot so concurrent updates cannot race with readers.
+	cloned := cloneDnsCache(cache)
+	c.dnsCacheMu.Unlock()
+	if err := c.cacheAccessCallback(cloned); err != nil {
 		c.log.Warnf("failed to access DNS cache: %v", err)
 		return nil
 	}
-	return cache
+	return cloned
 }
 
 // LookupDnsRespCache_ will modify the msg in place.
@@ -409,31 +415,39 @@ func (c *DnsController) __updateDnsCacheDeadline(host string, dnsTyp uint16, ans
 	deadline, originalDeadline := deadlineFunc(now, host)
 
 	cacheKey := c.cacheKey(fqdn, dnsTyp)
-	var oldCache *DnsCache
-
-	c.dnsCacheMu.Lock()
-	cache, ok := c.dnsCache[cacheKey]
-	if ok {
-		oldCache = cloneDnsCache(cache)
-		cache.CacheKey = cacheKey
-		cache.Answer = answers
-		cache.Deadline = deadline
-		cache.OriginalDeadline = originalDeadline
-		c.dnsCacheMu.Unlock()
-	} else {
-		cache, err = c.newCache(fqdn, answers, deadline, originalDeadline)
-		if err != nil {
-			c.dnsCacheMu.Unlock()
-			return err
-		}
-		cache.CacheKey = cacheKey
-		c.dnsCache[cacheKey] = cache
-		c.dnsCacheMu.Unlock()
+	// Copy-on-write: never mutate a published cache entry in place.
+	answerCopy := answers
+	if answers != nil {
+		answerCopy = deepcopy.Copy(answers).([]dnsmessage.RR)
 	}
-	if err = c.cacheUpdateCallback(oldCache, cloneDnsCache(cache)); err != nil {
+	newCache, err := c.newCache(fqdn, answerCopy, deadline, originalDeadline)
+	if err != nil {
 		return err
 	}
-	if err = c.cacheAccessCallback(cache); err != nil {
+	newCache.CacheKey = cacheKey
+
+	c.dnsCacheMu.Lock()
+	oldLive, hadOld := c.dnsCache[cacheKey]
+	var oldCache *DnsCache
+	if hadOld {
+		oldCache = cloneDnsCache(oldLive)
+	}
+	c.dnsCache[cacheKey] = newCache
+	c.dnsCacheMu.Unlock()
+
+	if err = c.cacheUpdateCallback(oldCache, cloneDnsCache(newCache)); err != nil {
+		c.dnsCacheMu.Lock()
+		if current, ok := c.dnsCache[cacheKey]; ok && current == newCache {
+			if !hadOld {
+				delete(c.dnsCache, cacheKey)
+			} else {
+				c.dnsCache[cacheKey] = oldLive
+			}
+		}
+		c.dnsCacheMu.Unlock()
+		return err
+	}
+	if err = c.cacheAccessCallback(newCache); err != nil {
 		return err
 	}
 
