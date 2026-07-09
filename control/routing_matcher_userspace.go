@@ -123,12 +123,16 @@ func (m *RoutingMatcher) Match(
 			// Tail of a rule (line).
 			// Decide whether to hit.
 			if !badRule {
-				if outbound == consts.OutboundControlPlaneRouting {
-					continue
-				}
 				if outbound == consts.OutboundMustRules {
 					must = true
 					continue
+				}
+				// Keep sync with kern/tproxy.c: control-plane / bump is a terminal hit.
+				if outbound == consts.OutboundControlPlaneRouting {
+					if must {
+						match.Must = true
+					}
+					return outbound, match.Mark, must || match.Must, nil
 				}
 				if must {
 					match.Must = true
