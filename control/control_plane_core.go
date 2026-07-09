@@ -7,7 +7,6 @@ package control
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net/netip"
 	"os"
@@ -46,8 +45,9 @@ type controlPlaneCore struct {
 	isReload   bool
 	bpfEjected bool
 
-	domainRefs  map[netip.Addr]map[string][]uint32
-	domainMapMu sync.Mutex
+	domainRefs           map[netip.Addr]map[string][]uint32
+	domainMapMu          sync.Mutex
+	domainRoutingFrozen  bool
 
 	closed context.Context
 	close  context.CancelFunc
@@ -612,9 +612,20 @@ func (c *controlPlaneCore) bindDaens() (err error) {
 	return
 }
 
+// FreezeDomainRouting makes subsequent domain map writes no-op. Used during
+// reload so the retiring control plane cannot overwrite shared kernel maps.
+func (c *controlPlaneCore) FreezeDomainRouting() {
+	c.domainMapMu.Lock()
+	c.domainRoutingFrozen = true
+	c.domainMapMu.Unlock()
+}
+
 func (c *controlPlaneCore) ReplaceDomain(oldCache, newCache *DnsCache) error {
 	c.domainMapMu.Lock()
 	defer c.domainMapMu.Unlock()
+	if c.domainRoutingFrozen {
+		return nil
+	}
 
 	previousRefs := cloneDomainRefs(c.domainRefs)
 	affected, err := c.replaceDomainStateLocked(oldCache, newCache)
@@ -625,7 +636,58 @@ func (c *controlPlaneCore) ReplaceDomain(oldCache, newCache *DnsCache) error {
 	if err = c.syncDomainRoutingMapsLocked(affected); err != nil {
 		c.domainRefs = previousRefs
 		if rollbackErr := c.syncDomainRoutingMapsLocked(affected); rollbackErr != nil {
-			return fmt.Errorf("%w; rollback domain routing: %v", err, rollbackErr)
+			return fmt.Errorf("%w; rollback domain routing: %w", err, rollbackErr)
+		}
+		return err
+	}
+	return nil
+}
+
+// ReplaceAllDomainRouting rebuilds domainRefs from caches and diff-syncs kernel
+// maps. Existing kernel keys are included in the affected set so stale entries
+// are deleted without a global clear window.
+func (c *controlPlaneCore) ReplaceAllDomainRouting(caches []*DnsCache) error {
+	c.domainMapMu.Lock()
+	defer c.domainMapMu.Unlock()
+	if c.domainRoutingFrozen {
+		return nil
+	}
+
+	previousRefs := cloneDomainRefs(c.domainRefs)
+	affected := make(map[netip.Addr]struct{})
+	for ip := range c.domainRefs {
+		affected[ip] = struct{}{}
+	}
+	if c.bpf != nil {
+		if err := addDomainRoutingMapIPs(c.bpf.DomainRoutingMap, affected); err != nil {
+			return fmt.Errorf("list domain routing map: %w", err)
+		}
+		if err := addDomainRoutingMapIPs(c.bpf.DomainBumpMap, affected); err != nil {
+			return fmt.Errorf("list domain bump map: %w", err)
+		}
+	}
+
+	c.domainRefs = make(map[netip.Addr]map[string][]uint32)
+	for _, cache := range caches {
+		if cache == nil {
+			continue
+		}
+		if _, err := c.replaceDomainStateLocked(nil, cache); err != nil {
+			c.domainRefs = previousRefs
+			return err
+		}
+	}
+	for ip := range c.domainRefs {
+		affected[ip] = struct{}{}
+	}
+
+	if c.bpf == nil {
+		return nil
+	}
+	if err := c.syncDomainRoutingMapsLocked(affected); err != nil {
+		c.domainRefs = previousRefs
+		if rollbackErr := c.syncDomainRoutingMapsLocked(affected); rollbackErr != nil {
+			return fmt.Errorf("%w; rollback domain routing: %w", err, rollbackErr)
 		}
 		return err
 	}
@@ -633,41 +695,7 @@ func (c *controlPlaneCore) ReplaceDomain(oldCache, newCache *DnsCache) error {
 }
 
 func (c *controlPlaneCore) ClearDomainRouting() error {
-	c.domainMapMu.Lock()
-	previousRefs := c.domainRefs
-	c.domainRefs = make(map[netip.Addr]map[string][]uint32)
-	c.domainMapMu.Unlock()
-
-	routingSnapshot, err := snapshotDomainRoutingMap(c.bpf.DomainRoutingMap)
-	if err != nil {
-		c.restoreDomainRefs(previousRefs)
-		return err
-	}
-	bumpSnapshot, err := snapshotDomainRoutingMap(c.bpf.DomainBumpMap)
-	if err != nil {
-		c.restoreDomainRefs(previousRefs)
-		return err
-	}
-
-	if err = deleteAllDomainRoutingMap(c.bpf.DomainRoutingMap); err != nil {
-		c.restoreDomainRefs(previousRefs)
-		if restoreErr := restoreDomainRoutingMap(c.bpf.DomainRoutingMap, routingSnapshot); restoreErr != nil {
-			return fmt.Errorf("%w; restore domain routing map: %v", err, restoreErr)
-		}
-		return err
-	}
-	if err = deleteAllDomainRoutingMap(c.bpf.DomainBumpMap); err != nil {
-		c.restoreDomainRefs(previousRefs)
-		restoreErr := errors.Join(
-			restoreDomainRoutingMap(c.bpf.DomainRoutingMap, routingSnapshot),
-			restoreDomainRoutingMap(c.bpf.DomainBumpMap, bumpSnapshot),
-		)
-		if restoreErr != nil {
-			return fmt.Errorf("%w; restore domain routing maps: %v", err, restoreErr)
-		}
-		return err
-	}
-	return nil
+	return c.ReplaceAllDomainRouting(nil)
 }
 
 func (c *controlPlaneCore) restoreDomainRefs(refs map[netip.Addr]map[string][]uint32) {
@@ -841,52 +869,21 @@ func domainCacheIPs(cache *DnsCache) []netip.Addr {
 	return ips
 }
 
-func snapshotDomainRoutingMap(m *ebpf.Map) (map[[4]uint32]bpfDomainRouting, error) {
-	snapshot := make(map[[4]uint32]bpfDomainRouting)
+func addDomainRoutingMapIPs(m *ebpf.Map, affected map[netip.Addr]struct{}) error {
+	if m == nil {
+		return nil
+	}
 	var key [4]uint32
 	var val bpfDomainRouting
 	iter := m.Iterate()
 	for iter.Next(&key, &val) {
-		snapshot[key] = val
+		ip, ok := netip.AddrFromSlice(common.Ipv6Uint32ArrayToByteSlice(key))
+		if !ok {
+			continue
+		}
+		affected[ip] = struct{}{}
 	}
-	return snapshot, iter.Err()
-}
-
-func restoreDomainRoutingMap(m *ebpf.Map, snapshot map[[4]uint32]bpfDomainRouting) error {
-	if err := deleteAllDomainRoutingMap(m); err != nil {
-		return err
-	}
-	if len(snapshot) == 0 {
-		return nil
-	}
-	keys := make([][4]uint32, 0, len(snapshot))
-	values := make([]bpfDomainRouting, 0, len(snapshot))
-	for key, val := range snapshot {
-		keys = append(keys, key)
-		values = append(values, val)
-	}
-	_, err := BpfMapBatchUpdate(m, keys, values, &ebpf.BatchOptions{
-		ElemFlags: uint64(ebpf.UpdateAny),
-	})
-	return err
-}
-
-func deleteAllDomainRoutingMap(m *ebpf.Map) error {
-	var key [4]uint32
-	var val bpfDomainRouting
-	keys := make([][4]uint32, 0)
-	iter := m.Iterate()
-	for iter.Next(&key, &val) {
-		keys = append(keys, key)
-	}
-	if err := iter.Err(); err != nil {
-		return err
-	}
-	if len(keys) == 0 {
-		return nil
-	}
-	_, err := BpfMapBatchDelete(m, keys)
-	return err
+	return iter.Err()
 }
 
 // EjectBpf will resect bpf from destroying life-cycle of control plane core.

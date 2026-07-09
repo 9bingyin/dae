@@ -258,6 +258,9 @@ loop:
 			if err := c.StopDNSListener(); err != nil {
 				log.Warnf("[Reload] Failed to stop old DNS listener: %v", err)
 			}
+			// Freeze domain-map writes on the retiring plane before the new plane
+			// rebuilds shared kernel maps (single-writer handoff).
+			c.FreezeDomainRouting()
 			oldDnsCache := c.CloneDnsCache()
 			var dnsCache map[string]*control.DnsCache
 			if conf.Dns.IpVersionPrefer == newConf.Dns.IpVersionPrefer {

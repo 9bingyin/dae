@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -93,6 +94,10 @@ type ControlPlane struct {
 	tproxyPortProtect bool
 	soMarkFromDae     uint32
 	mptcp             bool
+
+	// freezeDomainRouting stops DNS-driven domain map writes on this plane.
+	// Set during construction; used by FreezeDomainRouting on reload.
+	freezeDomainRouting func()
 }
 
 func NewControlPlane(
@@ -437,14 +442,19 @@ func NewControlPlane(
 	if err != nil {
 		return nil, err
 	}
-	domainRoutingActive := true
+	var domainRoutingActive atomic.Bool
+	domainRoutingActive.Store(true)
+	plane.freezeDomainRouting = func() {
+		domainRoutingActive.Store(false)
+		core.FreezeDomainRouting()
+	}
 	if plane.dnsController, err = NewDnsController(dnsUpstream, &DnsControllerOption{
 		Log: log,
 		CacheAccessCallback: func(cache *DnsCache) (err error) {
 			return nil
 		},
 		CacheUpdateCallback: func(oldCache, newCache *DnsCache) (err error) {
-			if !domainRoutingActive {
+			if !domainRoutingActive.Load() {
 				return nil
 			}
 			// Write mappings into eBPF map: IP record (from dns lookup) -> domain routing/bump state.
@@ -454,7 +464,7 @@ func NewControlPlane(
 			return nil
 		},
 		CacheRemoveCallback: func(cache *DnsCache) (err error) {
-			if !domainRoutingActive {
+			if !domainRoutingActive.Load() {
 				return nil
 			}
 			// Write mappings into eBPF map: IP record (from dns lookup) -> domain routing/bump state.
@@ -506,24 +516,19 @@ func NewControlPlane(
 
 	var importedCaches []*DnsCache
 	if len(dnsCache) > 0 {
-		domainRoutingActive = false
+		domainRoutingActive.Store(false)
 		importedCaches, err = plane.dnsController.ImportDnsCache(dnsCache)
-		domainRoutingActive = true
+		domainRoutingActive.Store(true)
 		if err != nil {
 			return nil, fmt.Errorf("import DNS cache: %w", err)
 		}
 		log.Infof("Imported %d DNS cache entries", len(importedCaches))
 	}
 
-	// Kernel maps are reused on reload, so rebuild domain routing/bump maps after
-	// all other fallible initialization succeeds.
+	// Kernel maps are reused on reload. Diff-rebuild domain routing/bump maps after
+	// fallible initialization so we never expose a fully-empty map window.
 	if _bpf != nil {
-		if err = core.ClearDomainRouting(); err != nil {
-			return nil, fmt.Errorf("clear domain routing: %w", err)
-		}
-	}
-	for _, cache := range importedCaches {
-		if err = core.ReplaceDomain(nil, cache); err != nil {
+		if err = core.ReplaceAllDomainRouting(importedCaches); err != nil {
 			return nil, fmt.Errorf("restore domain routing: %w", err)
 		}
 	}
@@ -584,6 +589,18 @@ func (c *ControlPlane) EjectBpf() *bpfObjects {
 
 func (c *ControlPlane) InjectBpf(bpf *bpfObjects) {
 	c.core.InjectBpf(bpf)
+}
+
+// FreezeDomainRouting stops this plane from writing shared domain eBPF maps.
+// Call before building a new control plane during reload.
+func (c *ControlPlane) FreezeDomainRouting() {
+	if c.freezeDomainRouting != nil {
+		c.freezeDomainRouting()
+		return
+	}
+	if c.core != nil {
+		c.core.FreezeDomainRouting()
+	}
 }
 
 func (c *ControlPlane) CloneDnsCache() map[string]*DnsCache {
@@ -817,23 +834,22 @@ type syscallConn interface {
 	SyscallConn() (syscall.RawConn, error)
 }
 
-func socketFD(conn syscallConn) (fd uint64, err error) {
-	rawConn, err := conn.SyscallConn()
-	if err != nil {
-		return 0, err
-	}
-	err = rawConn.Control(func(rawFd uintptr) {
-		fd = uint64(rawFd)
-	})
-	return fd, err
-}
-
 func (c *ControlPlane) updateListenSocketMap(key consts.ParamKey, conn syscallConn, description string) error {
-	fd, err := socketFD(conn)
+	rawConn, err := conn.SyscallConn()
 	if err != nil {
 		return fmt.Errorf("failed to retrieve %s fd: %w", description, err)
 	}
-	return c.core.bpf.ListenSocketMap.Update(key, fd, ebpf.UpdateAny)
+	var updateErr error
+	if err = rawConn.Control(func(rawFd uintptr) {
+		// fd is only valid inside Control; update the sockmap while it is held.
+		updateErr = c.core.bpf.ListenSocketMap.Update(key, uint64(rawFd), ebpf.UpdateAny)
+	}); err != nil {
+		return fmt.Errorf("failed to retrieve %s fd: %w", description, err)
+	}
+	if updateErr != nil {
+		return fmt.Errorf("update %s listen socket map: %w", description, updateErr)
+	}
+	return nil
 }
 
 func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err error) {
