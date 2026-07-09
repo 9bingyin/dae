@@ -419,6 +419,7 @@ func findSOA(msg *dnsmessage.Msg) *dnsmessage.SOA {
 	return nil
 }
 
+// dnsCacheIsNegative is the shared definition for NXDOMAIN / NODATA entries.
 func dnsCacheIsNegative(rcode int, answers []dnsmessage.RR) bool {
 	if rcode == dnsmessage.RcodeNameError {
 		return true
@@ -606,29 +607,39 @@ func (c *DnsController) HandleWithResponseWriter_(dnsMessage *dnsmessage.Msg, re
 		return err
 	}
 
-	// Join results and consider whether to response.
-	resp := c.LookupDnsRespCache_(dnsMessage, c.cacheKey(qname, qtype), true)
-	if resp == nil {
-		// resp is not valid.
+	// Join dual-stack lookups under ipversion_prefer.
+	cache := c.LookupDnsRespCache(c.cacheKey(qname, qtype), true)
+	cache2 := c.LookupDnsRespCache(c.cacheKey(qname, qtype2), true)
+	if !preferJoinReturnQueried(c.qtypePrefer, qtype, cache, cache2) {
 		c.log.WithFields(logrus.Fields{
 			"qname": qname,
-		}).Tracef("Reject %v due to resp not valid", qtype)
+		}).Tracef("Reject %v due to prefer join", qtype)
 		return c.sendRejectWithResponseWriter_(dnsMessage, req, responseWriter)
 	}
-	// resp is valid.
-	cache2 := c.LookupDnsRespCache(c.cacheKey(qname, qtype2), true)
-	if c.qtypePrefer == qtype || cache2 == nil || !cache2.IncludeAnyIp() {
-		if responseWriter != nil {
-			var respMsg dnsmessage.Msg
-			if err = respMsg.Unpack(resp); err != nil {
-				return fmt.Errorf("failed to unpack DNS response: %w", err)
-			}
-			return responseWriter.WriteMsg(&respMsg)
-		}
-		return sendPkt(c.log, resp, req.realDst, req.realSrc, req.src, req.lConn)
-	} else {
-		return c.sendRejectWithResponseWriter_(dnsMessage, req, responseWriter)
+	return c.writeDnsCacheToClient(cache, dnsMessage, req, responseWriter)
+}
+
+// preferJoinReturnQueried decides whether the queried-type cache should be
+// returned to the client under ipversion_prefer dual lookup.
+// NXDOMAIN for the queried type is always returned as-is.
+func preferJoinReturnQueried(prefer, qtype uint16, cache, cache2 *DnsCache) bool {
+	if cache == nil {
+		return false
 	}
+	if cache.Rcode == dnsmessage.RcodeNameError {
+		return true
+	}
+	return prefer == qtype || cache2 == nil || !cache2.IncludeAnyIp()
+}
+
+func (c *DnsController) writeDnsCacheToClient(cache *DnsCache, reqMsg *dnsmessage.Msg, req *udpRequest, responseWriter dnsmessage.ResponseWriter) error {
+	respMsg := new(dnsmessage.Msg)
+	respMsg.SetReply(reqMsg)
+	cache.FillInto(respMsg)
+	// FillInto overwrites Rcode/Answer; keep question/id from the client request.
+	respMsg.Id = reqMsg.Id
+	respMsg.Question = reqMsg.Question
+	return writeDNSResponse(c.log, respMsg, reqMsg.Id, req, responseWriter)
 }
 
 func (c *DnsController) handle_(

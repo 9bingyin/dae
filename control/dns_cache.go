@@ -34,15 +34,13 @@ func (c *DnsCache) FillInto(req *dnsmessage.Msg) {
 	req.Truncated = false
 }
 
-// IsNegative reports NXDOMAIN or NODATA-style empty success answers.
+// IsNegative reports NXDOMAIN or NODATA (NOERROR with empty answer).
+// CNAME-only success answers are not negative.
 func (c *DnsCache) IsNegative() bool {
 	if c == nil {
 		return false
 	}
-	if c.Rcode == dnsmessage.RcodeNameError {
-		return true
-	}
-	return c.Rcode == dnsmessage.RcodeSuccess && !c.IncludeAnyIp() && len(c.Answer) == 0
+	return dnsCacheIsNegative(c.Rcode, c.Answer)
 }
 
 func (c *DnsCache) IncludeIp(ip netip.Addr) bool {

@@ -463,3 +463,86 @@ func testSOA(ttl, minttl uint32) *dnsmessage.SOA {
 		Minttl: minttl,
 	}
 }
+
+func TestPreferJoinPreservesQueriedNxdomain(t *testing.T) {
+	// Client queries AAAA (non-prefer); prefer A has addresses; AAAA is NXDOMAIN.
+	queried := &DnsCache{Rcode: dnsmessage.RcodeNameError}
+	other := &DnsCache{
+		Rcode: dnsmessage.RcodeSuccess,
+		Answer: []dnsmessage.RR{
+			&dnsmessage.A{A: net.ParseIP("192.0.2.50").To4()},
+		},
+	}
+	if !preferJoinReturnQueried(dnsmessage.TypeA, dnsmessage.TypeAAAA, queried, other) {
+		t.Fatal("queried NXDOMAIN must be returned even when prefer family has IPs")
+	}
+}
+
+func TestPreferJoinRejectsNonPreferWhenPreferHasIp(t *testing.T) {
+	queried := &DnsCache{
+		Rcode: dnsmessage.RcodeSuccess,
+		Answer: []dnsmessage.RR{
+			&dnsmessage.AAAA{AAAA: net.ParseIP("2001:db8::1")},
+		},
+	}
+	other := &DnsCache{
+		Rcode: dnsmessage.RcodeSuccess,
+		Answer: []dnsmessage.RR{
+			&dnsmessage.A{A: net.ParseIP("192.0.2.50").To4()},
+		},
+	}
+	if preferJoinReturnQueried(dnsmessage.TypeA, dnsmessage.TypeAAAA, queried, other) {
+		t.Fatal("non-prefer positive answer should be suppressed when prefer has IPs")
+	}
+}
+
+func TestPreferJoinReturnsPreferType(t *testing.T) {
+	queried := &DnsCache{
+		Rcode: dnsmessage.RcodeSuccess,
+		Answer: []dnsmessage.RR{
+			&dnsmessage.A{A: net.ParseIP("192.0.2.50").To4()},
+		},
+	}
+	other := &DnsCache{
+		Rcode: dnsmessage.RcodeSuccess,
+		Answer: []dnsmessage.RR{
+			&dnsmessage.AAAA{AAAA: net.ParseIP("2001:db8::1")},
+		},
+	}
+	if !preferJoinReturnQueried(dnsmessage.TypeA, dnsmessage.TypeA, queried, other) {
+		t.Fatal("prefer-type query should return its cache")
+	}
+}
+
+func TestPreferJoinReturnsWhenOtherIsNodata(t *testing.T) {
+	queried := &DnsCache{
+		Rcode: dnsmessage.RcodeSuccess,
+		Answer: []dnsmessage.RR{
+			&dnsmessage.AAAA{AAAA: net.ParseIP("2001:db8::1")},
+		},
+	}
+	other := &DnsCache{Rcode: dnsmessage.RcodeSuccess} // NODATA
+	if !preferJoinReturnQueried(dnsmessage.TypeA, dnsmessage.TypeAAAA, queried, other) {
+		t.Fatal("non-prefer answer should be returned when prefer side has no IP")
+	}
+}
+
+func TestIsNegativeConsistentWithDnsCacheIsNegative(t *testing.T) {
+	if !(&DnsCache{Rcode: dnsmessage.RcodeNameError, Answer: []dnsmessage.RR{
+		&dnsmessage.A{A: net.ParseIP("192.0.2.1").To4()},
+	}}).IsNegative() {
+		// NXDOMAIN is negative by rcode even if dirty answers remain in a hand-built entry.
+		t.Fatal("NXDOMAIN should be negative")
+	}
+	if !(&DnsCache{Rcode: dnsmessage.RcodeSuccess}).IsNegative() {
+		t.Fatal("empty NOERROR should be negative (NODATA)")
+	}
+	if (&DnsCache{
+		Rcode: dnsmessage.RcodeSuccess,
+		Answer: []dnsmessage.RR{
+			&dnsmessage.CNAME{Target: "x.example."},
+		},
+	}).IsNegative() {
+		t.Fatal("CNAME-only must not be negative")
+	}
+}
