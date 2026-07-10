@@ -296,22 +296,6 @@ func (c *DnsController) LookupDnsRespCache(cacheKey string, ignoreFixedTtl bool)
 	return cloned
 }
 
-// LookupDnsRespCache_ will modify the msg in place.
-func (c *DnsController) LookupDnsRespCache_(msg *dnsmessage.Msg, cacheKey string, ignoreFixedTtl bool) (resp []byte) {
-	cache := c.LookupDnsRespCache(cacheKey, ignoreFixedTtl)
-	if cache != nil {
-		cache.FillInto(msg)
-		msg.Compress = true
-		b, err := msg.Pack()
-		if err != nil {
-			c.log.Warnf("failed to pack: %v", err)
-			return nil
-		}
-		return b
-	}
-	return nil
-}
-
 // NormalizeAndCacheDnsResp_ handle DNS resp in place.
 func (c *DnsController) NormalizeAndCacheDnsResp_(msg *dnsmessage.Msg) (err error) {
 	// Check healthy resp.
@@ -632,13 +616,29 @@ func preferJoinReturnQueried(prefer, qtype uint16, cache, cache2 *DnsCache) bool
 	return prefer == qtype || cache2 == nil || !cache2.IncludeAnyIp()
 }
 
+// replyDnsCache sends a cache hit when a response is required and records the
+// same cache-hit log for the fast and post-lock lookup paths.
+func (c *DnsController) replyDnsCache(cache *DnsCache, dnsMessage *dnsmessage.Msg, req *udpRequest, needResp bool, responseWriter dnsmessage.ResponseWriter) error {
+	if needResp {
+		if err := c.writeDnsCacheToClient(cache, dnsMessage, req, responseWriter); err != nil {
+			return fmt.Errorf("write cached DNS response: %w", err)
+		}
+	}
+	if c.log.IsLevelEnabled(logrus.DebugLevel) && len(dnsMessage.Question) > 0 {
+		q := dnsMessage.Question[0]
+		c.log.Debugf("UDP(DNS) %v <-> Cache: %v %v",
+			RefineSourceToShow(req.realSrc, req.realDst.Addr()), strings.ToLower(q.Name), QtypeToString(q.Qtype),
+		)
+	}
+	return nil
+}
+
+// writeDnsCacheToClient renders a cache entry using a copy of the client
+// request as the response skeleton. This preserves the cache-hit wire behavior
+// for all questions and EDNS options while FillInto supplies cached DNS fields.
 func (c *DnsController) writeDnsCacheToClient(cache *DnsCache, reqMsg *dnsmessage.Msg, req *udpRequest, responseWriter dnsmessage.ResponseWriter) error {
-	respMsg := new(dnsmessage.Msg)
-	respMsg.SetReply(reqMsg)
+	respMsg := deepcopy.Copy(reqMsg).(*dnsmessage.Msg)
 	cache.FillInto(respMsg)
-	// FillInto overwrites Rcode/Answer; keep question/id from the client request.
-	respMsg.Id = reqMsg.Id
-	respMsg.Question = reqMsg.Question
 	return writeDNSResponse(c.log, respMsg, reqMsg.Id, req, responseWriter)
 }
 
@@ -682,7 +682,15 @@ func (c *DnsController) handleWithResponseWriter_(
 		return c.sendRejectWithResponseWriter_(dnsMessage, req, responseWriter)
 	}
 
-	// No parallel for the same lookup.
+	// Cache hits do not need to wait behind an in-flight miss for the same key.
+	// Request selection remains above this check so reject policy can still
+	// invalidate an existing cache entry.
+	if cache := c.LookupDnsRespCache(cacheKey, false); cache != nil {
+		return c.replyDnsCache(cache, dnsMessage, req, needResp, responseWriter)
+	}
+
+	// No parallel upstream lookup for the same cache key. Recheck the cache
+	// after acquiring this lock because another request may have populated it.
 	handlingState_, _ := c.handling.LoadOrStore(cacheKey, new(handlingState))
 	handlingState := handlingState_.(*handlingState)
 	atomic.AddUint32(&handlingState.ref, 1)
@@ -695,27 +703,8 @@ func (c *DnsController) handleWithResponseWriter_(
 		}
 	}()
 
-	if resp := c.LookupDnsRespCache_(dnsMessage, cacheKey, false); resp != nil {
-		// Send cache to client directly.
-		if needResp {
-			if responseWriter != nil {
-				var respMsg dnsmessage.Msg
-				if err = respMsg.Unpack(resp); err != nil {
-					return fmt.Errorf("failed to unpack DNS response: %w", err)
-				}
-				return responseWriter.WriteMsg(&respMsg)
-			}
-			if err = sendPkt(c.log, resp, req.realDst, req.realSrc, req.src, req.lConn); err != nil {
-				return fmt.Errorf("failed to write cached DNS resp: %w", err)
-			}
-		}
-		if c.log.IsLevelEnabled(logrus.DebugLevel) && len(dnsMessage.Question) > 0 {
-			q := dnsMessage.Question[0]
-			c.log.Debugf("UDP(DNS) %v <-> Cache: %v %v",
-				RefineSourceToShow(req.realSrc, req.realDst.Addr()), strings.ToLower(q.Name), QtypeToString(q.Qtype),
-			)
-		}
-		return nil
+	if cache := c.LookupDnsRespCache(cacheKey, false); cache != nil {
+		return c.replyDnsCache(cache, dnsMessage, req, needResp, responseWriter)
 	}
 
 	if c.log.IsLevelEnabled(logrus.TraceLevel) {

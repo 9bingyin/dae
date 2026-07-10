@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/netip"
 	"testing"
+	"time"
 
 	dnscomponent "github.com/daeuniverse/dae/component/dns"
 	"github.com/daeuniverse/dae/config"
@@ -76,6 +77,57 @@ func TestWriteDNSResponseUsesResponseWriter(t *testing.T) {
 	}
 }
 
+func TestWriteDnsCacheToClientPreservesRequestWireContext(t *testing.T) {
+	request := new(dnsmessage.Msg)
+	request.Id = 0x1234
+	request.RecursionDesired = true
+	request.CheckingDisabled = true
+	request.Question = []dnsmessage.Question{
+		{Name: "example.com.", Qtype: dnsmessage.TypeA, Qclass: dnsmessage.ClassINET},
+		{Name: "example.net.", Qtype: dnsmessage.TypeAAAA, Qclass: dnsmessage.ClassINET},
+	}
+	opt := &dnsmessage.OPT{Hdr: dnsmessage.RR_Header{Name: ".", Rrtype: dnsmessage.TypeOPT, Class: 1232}}
+	opt.SetDo()
+	request.Extra = []dnsmessage.RR{opt}
+
+	cache := &DnsCache{
+		Rcode: dnsmessage.RcodeNameError,
+	}
+	writer := new(recordingDNSResponseWriter)
+	controller := &DnsController{}
+	if err := controller.writeDnsCacheToClient(cache, request, &udpRequest{}, writer); err != nil {
+		t.Fatalf("write DNS cache: %v", err)
+	}
+	if writer.msg == nil {
+		t.Fatal("response writer was not used")
+	}
+	if writer.msg.Id != request.Id {
+		t.Fatalf("response id = %d, want %d", writer.msg.Id, request.Id)
+	}
+	if !writer.msg.RecursionDesired || !writer.msg.CheckingDisabled {
+		t.Fatal("response did not preserve RD/CD request flags")
+	}
+	if !writer.msg.Response || !writer.msg.RecursionAvailable || writer.msg.Truncated {
+		t.Fatal("response did not contain the expected cached response flags")
+	}
+	if writer.msg.Rcode != dnsmessage.RcodeNameError || len(writer.msg.Answer) != 0 {
+		t.Fatalf("cached NXDOMAIN = rcode %d, answers %d", writer.msg.Rcode, len(writer.msg.Answer))
+	}
+	if len(writer.msg.Question) != len(request.Question) {
+		t.Fatalf("response question count = %d, want %d", len(writer.msg.Question), len(request.Question))
+	}
+	if len(writer.msg.Extra) != 1 {
+		t.Fatalf("response extra count = %d, want 1", len(writer.msg.Extra))
+	}
+	responseOpt, ok := writer.msg.Extra[0].(*dnsmessage.OPT)
+	if !ok || !responseOpt.Do() || responseOpt.UDPSize() != 1232 {
+		t.Fatalf("response did not preserve EDNS OPT: %#v", writer.msg.Extra[0])
+	}
+	if request.Response || request.Rcode != dnsmessage.RcodeSuccess || len(request.Answer) != 0 {
+		t.Fatal("rendering cache response mutated the request")
+	}
+}
+
 func TestHandleWithResponseWriterSkipsRejectWhenResponseNotNeeded(t *testing.T) {
 	dnsRouting, err := dnscomponent.New(&config.Dns{
 		Routing: config.DnsRouting{
@@ -112,6 +164,75 @@ func TestHandleWithResponseWriterSkipsRejectWhenResponseNotNeeded(t *testing.T) 
 	}
 	if writer.msg != nil {
 		t.Fatalf("unexpected response: %+v", writer.msg)
+	}
+}
+
+func TestHandleWithResponseWriterCacheHitBypassesHandlingLock(t *testing.T) {
+	dnsRouting, err := dnscomponent.New(&config.Dns{
+		Routing: config.DnsRouting{
+			Request:  config.DnsRequestRouting{Fallback: "asis"},
+			Response: config.DnsResponseRouting{Fallback: "accept"},
+		},
+	}, &dnscomponent.NewOption{
+		Logger: logrus.New(),
+		UpstreamReadyCallback: func(*dnscomponent.Upstream) error {
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("new DNS routing: %v", err)
+	}
+
+	controller, err := NewDnsController(dnsRouting, &DnsControllerOption{Log: logrus.New()})
+	if err != nil {
+		t.Fatalf("new DNS controller: %v", err)
+	}
+	cacheKey := controller.cacheKey("example.com.", dnsmessage.TypeA)
+	controller.dnsCache[cacheKey] = &DnsCache{
+		Answer: []dnsmessage.RR{
+			&dnsmessage.A{
+				Hdr: dnsmessage.RR_Header{
+					Name:   "example.com.",
+					Rrtype: dnsmessage.TypeA,
+					Class:  dnsmessage.ClassINET,
+					Ttl:    0,
+				},
+				A: net.ParseIP("192.0.2.10").To4(),
+			},
+		},
+		Deadline:         time.Now().Add(time.Minute),
+		OriginalDeadline: time.Now().Add(time.Minute),
+	}
+
+	state := new(handlingState)
+	state.mu.Lock()
+	controller.handling.Store(cacheKey, state)
+	defer state.mu.Unlock()
+
+	msg := new(dnsmessage.Msg)
+	msg.SetQuestion("example.com.", dnsmessage.TypeA)
+	writer := new(recordingDNSResponseWriter)
+	req := &udpRequest{
+		realSrc:       netip.MustParseAddrPort("192.0.2.2:12345"),
+		realDst:       netip.MustParseAddrPort("192.0.2.1:53"),
+		src:           netip.MustParseAddrPort("192.0.2.2:12345"),
+		routingResult: &bpfRoutingResult{},
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- controller.handleWithResponseWriter_(msg, req, true, writer)
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("handle DNS request: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cache hit waited for the handling lock")
+	}
+	if writer.msg == nil || len(writer.msg.Answer) != 1 {
+		t.Fatalf("unexpected cache response: %+v", writer.msg)
 	}
 }
 
