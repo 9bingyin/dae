@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/daeuniverse/dae/common/consts"
@@ -152,34 +153,43 @@ func (u *Upstream) String() string {
 	return string(u.Scheme) + "://" + net.JoinHostPort(u.Hostname, strconv.Itoa(int(u.Port))) + u.Path
 }
 
+// newUpstreamFunc is a test seam for deterministic UpstreamResolver tests.
+var newUpstreamFunc = NewUpstream
+
 type UpstreamResolver struct {
 	Raw     *url.URL
 	Network string
-	// FinishInitCallback may be invoked again if err is not nil
+	// FinishInitCallback may be invoked again if initialization fails.
 	FinishInitCallback func(raw *url.URL, upstream *Upstream) (err error)
-	mu                 sync.Mutex
-	upstream           *Upstream
-	init               bool
+
+	// initMu serializes initialization and its callback. The published upstream
+	// is immutable after initialization, so successful reads can avoid this lock.
+	initMu   sync.Mutex
+	upstream atomic.Pointer[Upstream]
 }
 
-func (u *UpstreamResolver) GetUpstream() (_ *Upstream, err error) {
-	u.mu.Lock()
-	defer u.mu.Unlock()
-	if !u.init {
-		defer func() {
-			if err == nil {
-				if err = u.FinishInitCallback(u.Raw, u.upstream); err != nil {
-					u.upstream = nil
-					return
-				}
-				u.init = true
-			}
-		}()
-		ctx, cancel := context.WithTimeout(context.TODO(), 10*time.Second)
-		defer cancel()
-		if u.upstream, err = NewUpstream(ctx, u.Raw, u.Network); err != nil {
-			return nil, fmt.Errorf("failed to init dns upstream: %w", err)
-		}
+func (u *UpstreamResolver) GetUpstream() (*Upstream, error) {
+	if upstream := u.upstream.Load(); upstream != nil {
+		return upstream, nil
 	}
-	return u.upstream, nil
+
+	u.initMu.Lock()
+	defer u.initMu.Unlock()
+
+	if upstream := u.upstream.Load(); upstream != nil {
+		return upstream, nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.TODO(), 10*time.Second)
+	defer cancel()
+	upstream, err := newUpstreamFunc(ctx, u.Raw, u.Network)
+	if err != nil {
+		return nil, fmt.Errorf("failed to init dns upstream: %w", err)
+	}
+	if err := u.FinishInitCallback(u.Raw, upstream); err != nil {
+		return nil, err
+	}
+
+	u.upstream.Store(upstream)
+	return upstream, nil
 }
