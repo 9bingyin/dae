@@ -34,6 +34,8 @@ const (
 	minFirefoxCacheTtl = 120
 	// RFC 2308: cap long SOA-derived negative TTLs.
 	maxNegativeCacheTtl = 3600
+
+	dnsCacheLockShards = 256
 )
 
 type IpVersionPrefer int
@@ -81,7 +83,11 @@ type DnsController struct {
 	timeoutExceedCallback func(dialArgument *dialArgument, err error)
 
 	fixedDomainTtl map[string]int
-	// mutex protects the dnsCache.
+	// dnsCacheKeyLocks serialize cache publication and mapping callbacks for a
+	// cache key. dnsCacheMu only protects access to the map itself.
+	// Lock order: cache key shard -> dnsCacheMu -> callback -> domainMapMu.
+	// Callbacks must not re-enter DnsController cache operations.
+	dnsCacheKeyLocks    [dnsCacheLockShards]sync.Mutex
 	dnsCacheMu          sync.Mutex
 	dnsCache            map[string]*DnsCache
 	dnsForwarderCacheMu sync.Mutex
@@ -163,6 +169,31 @@ func (c *DnsController) cacheKey(qname string, qtype uint16) string {
 	return dnsmessage.CanonicalName(qname) + strconv.Itoa(int(qtype))
 }
 
+func (c *DnsController) dnsCacheKeyLock(cacheKey string) *sync.Mutex {
+	// FNV-1a is sufficient for distributing cache keys across lock shards.
+	var hash uint32 = 2166136261
+	for i := 0; i < len(cacheKey); i++ {
+		hash ^= uint32(cacheKey[i])
+		hash *= 16777619
+	}
+	return &c.dnsCacheKeyLocks[hash%uint32(len(c.dnsCacheKeyLocks))]
+}
+
+func (c *DnsController) cloneDnsCache() map[string]*DnsCache {
+	for i := range c.dnsCacheKeyLocks {
+		c.dnsCacheKeyLocks[i].Lock()
+	}
+	defer func() {
+		for i := len(c.dnsCacheKeyLocks) - 1; i >= 0; i-- {
+			c.dnsCacheKeyLocks[i].Unlock()
+		}
+	}()
+
+	c.dnsCacheMu.Lock()
+	defer c.dnsCacheMu.Unlock()
+	return deepcopy.Copy(c.dnsCache).(map[string]*DnsCache)
+}
+
 func splitDnsCacheKey(cacheKey string) (fqdn string, ok bool) {
 	lastDot := strings.LastIndex(cacheKey, ".")
 	if lastDot == -1 || lastDot == len(cacheKey)-1 {
@@ -207,47 +238,47 @@ func (c *DnsController) importDnsCache(cacheKey string, fqdn string, cache *DnsC
 	newCache.CacheKey = cacheKey
 	newCache.Rcode = cache.Rcode
 
-	var oldCache *DnsCache
+	keyLock := c.dnsCacheKeyLock(cacheKey)
+	keyLock.Lock()
+	defer keyLock.Unlock()
+
 	c.dnsCacheMu.Lock()
-	if cache, ok := c.dnsCache[cacheKey]; ok {
-		oldCache = cloneDnsCache(cache)
-	}
-	c.dnsCache[cacheKey] = newCache
+	oldCache := cloneDnsCache(c.dnsCache[cacheKey])
 	c.dnsCacheMu.Unlock()
 
 	if err = c.cacheUpdateCallback(oldCache, cloneDnsCache(newCache)); err != nil {
-		c.dnsCacheMu.Lock()
-		if oldCache == nil {
-			delete(c.dnsCache, cacheKey)
-		} else {
-			c.dnsCache[cacheKey] = oldCache
-		}
-		c.dnsCacheMu.Unlock()
 		return nil, err
 	}
+
+	c.dnsCacheMu.Lock()
+	c.dnsCache[cacheKey] = newCache
+	c.dnsCacheMu.Unlock()
 	return cloneDnsCache(newCache), nil
 }
 
 func (c *DnsController) RemoveDnsRespCache(cacheKey string) {
-	cache, ok := c.removeDnsRespCache(cacheKey, nil)
+	keyLock := c.dnsCacheKeyLock(cacheKey)
+	keyLock.Lock()
+	defer keyLock.Unlock()
+
+	c.dnsCacheMu.Lock()
+	cache, ok := c.dnsCache[cacheKey]
+	removed := cloneDnsCache(cache)
+	c.dnsCacheMu.Unlock()
 	if !ok {
 		return
 	}
-	if err := c.cacheRemoveCallback(cache); err != nil {
+
+	if err := c.cacheRemoveCallback(removed); err != nil {
 		c.log.Warnf("failed to remove DNS cache mapping: %v", err)
+		return
 	}
-}
 
-func (c *DnsController) removeDnsRespCache(cacheKey string, expected *DnsCache) (*DnsCache, bool) {
 	c.dnsCacheMu.Lock()
-	defer c.dnsCacheMu.Unlock()
-
-	cache, ok := c.dnsCache[cacheKey]
-	if !ok || expected != nil && cache != expected {
-		return nil, false
+	if c.dnsCache[cacheKey] == cache {
+		delete(c.dnsCache, cacheKey)
 	}
-	delete(c.dnsCache, cacheKey)
-	return cloneDnsCache(cache), true
+	c.dnsCacheMu.Unlock()
 }
 
 func cloneDnsCache(cache *DnsCache) *DnsCache {
@@ -263,6 +294,10 @@ func cloneDnsCache(cache *DnsCache) *DnsCache {
 }
 
 func (c *DnsController) LookupDnsRespCache(cacheKey string, ignoreFixedTtl bool) (cache *DnsCache) {
+	keyLock := c.dnsCacheKeyLock(cacheKey)
+	keyLock.Lock()
+	defer keyLock.Unlock()
+
 	c.dnsCacheMu.Lock()
 	cache, ok := c.dnsCache[cacheKey]
 	if !ok {
@@ -275,15 +310,20 @@ func (c *DnsController) LookupDnsRespCache(cacheKey string, ignoreFixedTtl bool)
 	} else {
 		deadline = cache.OriginalDeadline
 	}
-	// We should make sure the cache did not expire, or
-	// return nil and request a new lookup to refresh the cache.
+	// Remove the mapping before making an expired entry absent. Holding the
+	// per-key lock prevents a late removal from overtaking a refresh.
 	if !deadline.After(time.Now()) {
-		delete(c.dnsCache, cacheKey)
 		removed := cloneDnsCache(cache)
 		c.dnsCacheMu.Unlock()
 		if err := c.cacheRemoveCallback(removed); err != nil {
 			c.log.Warnf("failed to remove expired DNS cache mapping: %v", err)
+			return nil
 		}
+		c.dnsCacheMu.Lock()
+		if c.dnsCache[cacheKey] == cache {
+			delete(c.dnsCache, cacheKey)
+		}
+		c.dnsCacheMu.Unlock()
 		return nil
 	}
 	// Return a snapshot so concurrent updates cannot race with readers.
@@ -449,28 +489,24 @@ func (c *DnsController) __updateDnsCacheDeadline(host string, dnsTyp uint16, ans
 	newCache.CacheKey = cacheKey
 	newCache.Rcode = rcode
 
+	keyLock := c.dnsCacheKeyLock(cacheKey)
+	keyLock.Lock()
+	defer keyLock.Unlock()
+
 	c.dnsCacheMu.Lock()
-	oldLive, hadOld := c.dnsCache[cacheKey]
-	var oldCache *DnsCache
-	if hadOld {
-		oldCache = cloneDnsCache(oldLive)
+	oldCache := cloneDnsCache(c.dnsCache[cacheKey])
+	c.dnsCacheMu.Unlock()
+
+	// Commit the domain mapping before publishing the DNS answer. Lookups for
+	// this key wait on keyLock and cannot observe a partially committed entry.
+	if err = c.cacheUpdateCallback(oldCache, cloneDnsCache(newCache)); err != nil {
+		return err
 	}
+	c.dnsCacheMu.Lock()
 	c.dnsCache[cacheKey] = newCache
 	c.dnsCacheMu.Unlock()
 
-	if err = c.cacheUpdateCallback(oldCache, cloneDnsCache(newCache)); err != nil {
-		c.dnsCacheMu.Lock()
-		if current, ok := c.dnsCache[cacheKey]; ok && current == newCache {
-			if !hadOld {
-				delete(c.dnsCache, cacheKey)
-			} else {
-				c.dnsCache[cacheKey] = oldLive
-			}
-		}
-		c.dnsCacheMu.Unlock()
-		return err
-	}
-	if err = c.cacheAccessCallback(newCache); err != nil {
+	if err = c.cacheAccessCallback(cloneDnsCache(newCache)); err != nil {
 		return err
 	}
 

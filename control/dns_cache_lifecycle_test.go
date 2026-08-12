@@ -6,6 +6,7 @@
 package control
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -71,6 +72,169 @@ func TestDnsCacheExpiredLookupRemovesMapping(t *testing.T) {
 	}
 
 	assertRemovedCache(t, recorder.removed, "192.0.2.1")
+}
+
+func TestDnsCacheUpdatePublishesAfterMappingCommit(t *testing.T) {
+	commitStarted := make(chan struct{})
+	releaseCommit := make(chan struct{})
+	controller, err := NewDnsController(nil, &DnsControllerOption{
+		Log: logrus.New(),
+		CacheUpdateCallback: func(_, _ *DnsCache) error {
+			close(commitStarted)
+			<-releaseCommit
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("new DNS controller: %v", err)
+	}
+	cacheKey := controller.cacheKey("example.com.", dnsmessage.TypeA)
+
+	updateDone := make(chan error, 1)
+	go func() {
+		answer := testDnsCache("", nil, "192.0.2.1")
+		updateDone <- controller.UpdateDnsCacheTtl("example.com", dnsmessage.TypeA, answer.Answer, 60)
+	}()
+	<-commitStarted
+
+	lookupStarted := make(chan struct{})
+	lookupDone := make(chan *DnsCache, 1)
+	go func() {
+		close(lookupStarted)
+		lookupDone <- controller.LookupDnsRespCache(cacheKey, false)
+	}()
+	<-lookupStarted
+
+	select {
+	case cache := <-lookupDone:
+		close(releaseCommit)
+		<-updateDone
+		t.Fatalf("DNS cache became visible before mapping commit: %v", cache)
+	default:
+	}
+
+	close(releaseCommit)
+	if err := <-updateDone; err != nil {
+		t.Fatalf("update DNS cache: %v", err)
+	}
+	cache := <-lookupDone
+	if cache == nil || !cache.IncludeIp(testAddr("192.0.2.1")) {
+		t.Fatalf("committed DNS cache is unavailable: %v", cache)
+	}
+}
+
+func TestExpiredDnsCacheRemovalCannotOvertakeRefresh(t *testing.T) {
+	core := newTestControlPlaneCore()
+	removeStarted := make(chan struct{})
+	releaseRemove := make(chan struct{})
+	refreshCommitStarted := make(chan struct{})
+	firstUpdate := true
+
+	applyUpdate := func(oldCache, newCache *DnsCache) error {
+		core.domainMapMu.Lock()
+		defer core.domainMapMu.Unlock()
+		_, err := core.replaceDomainStateLocked(oldCache, newCache)
+		return err
+	}
+	controller, err := NewDnsController(nil, &DnsControllerOption{
+		Log: logrus.New(),
+		NewCache: func(_ string, answers []dnsmessage.RR, deadline time.Time, originalDeadline time.Time) (*DnsCache, error) {
+			return &DnsCache{
+				DomainBitmap:     testDomainBitmap(0),
+				Answer:           answers,
+				Deadline:         deadline,
+				OriginalDeadline: originalDeadline,
+			}, nil
+		},
+		CacheUpdateCallback: func(oldCache, newCache *DnsCache) error {
+			if firstUpdate {
+				firstUpdate = false
+			} else {
+				close(refreshCommitStarted)
+			}
+			return applyUpdate(oldCache, newCache)
+		},
+		CacheRemoveCallback: func(cache *DnsCache) error {
+			close(removeStarted)
+			<-releaseRemove
+			return applyUpdate(cache, nil)
+		},
+	})
+	if err != nil {
+		t.Fatalf("new DNS controller: %v", err)
+	}
+
+	answer := testDnsCache("", nil, "192.0.2.1")
+	if err := controller.UpdateDnsCacheTtl("example.com", dnsmessage.TypeA, answer.Answer, -1); err != nil {
+		t.Fatalf("seed expired DNS cache: %v", err)
+	}
+
+	lookupDone := make(chan *DnsCache, 1)
+	go func() {
+		lookupDone <- controller.LookupDnsRespCache(controller.cacheKey("example.com.", dnsmessage.TypeA), false)
+	}()
+	<-removeStarted
+
+	refreshStarted := make(chan struct{})
+	refreshDone := make(chan error, 1)
+	go func() {
+		close(refreshStarted)
+		refreshDone <- controller.UpdateDnsCacheTtl("example.com", dnsmessage.TypeA, answer.Answer, 60)
+	}()
+	<-refreshStarted
+
+	select {
+	case <-refreshCommitStarted:
+		close(releaseRemove)
+		<-lookupDone
+		<-refreshDone
+		t.Fatal("refresh mapping commit overtook expired cache removal")
+	default:
+	}
+
+	close(releaseRemove)
+	if cache := <-lookupDone; cache != nil {
+		t.Fatalf("expired cache lookup returned cache: %v", cache)
+	}
+	if err := <-refreshDone; err != nil {
+		t.Fatalf("refresh DNS cache: %v", err)
+	}
+	select {
+	case <-refreshCommitStarted:
+	default:
+		t.Fatal("refresh mapping was not committed")
+	}
+
+	ip := testAddr("192.0.2.1")
+	core.domainMapMu.Lock()
+	_, present := core.domainRefs[ip]
+	core.domainMapMu.Unlock()
+	if !present {
+		t.Fatal("expired cache removal deleted the refreshed domain mapping")
+	}
+}
+
+func TestDnsCacheRemovalFailureKeepsCache(t *testing.T) {
+	controller, err := NewDnsController(nil, &DnsControllerOption{
+		Log: logrus.New(),
+		CacheRemoveCallback: func(*DnsCache) error {
+			return errors.New("simulated mapping removal failure")
+		},
+	})
+	if err != nil {
+		t.Fatalf("new DNS controller: %v", err)
+	}
+
+	answer := testDnsCache("", nil, "192.0.2.1")
+	if err := controller.UpdateDnsCacheTtl("example.com", dnsmessage.TypeA, answer.Answer, 60); err != nil {
+		t.Fatalf("update DNS cache: %v", err)
+	}
+	cacheKey := controller.cacheKey("example.com.", dnsmessage.TypeA)
+	controller.RemoveDnsRespCache(cacheKey)
+
+	if cache := controller.LookupDnsRespCache(cacheKey, false); cache == nil {
+		t.Fatal("cache was removed after mapping removal failed")
+	}
 }
 
 func TestDnsCacheImportRebuildsDomainBitmap(t *testing.T) {
