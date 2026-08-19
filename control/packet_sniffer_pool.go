@@ -9,29 +9,42 @@ import (
 	"fmt"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/daeuniverse/dae/component/sniffing"
+	"github.com/daeuniverse/outbound/pool"
 )
 
 const (
-	PacketSnifferTtl = 3 * time.Second
+	MaxQuicHeldDatagrams  = 16
+	MaxQuicHeldBytes      = 32 << 10
+	MaxActiveQuicSniffers = 1024
 )
 
 type PacketSniffer struct {
-	*sniffing.Sniffer
+	Sniffer *sniffing.QuicSniffer
+	Mu      sync.Mutex
+
 	deadlineTimer *time.Timer
-	Mu            sync.Mutex
+	heldPackets   []pool.PB
+	heldBytes     int
+	onTimeout     func(*PacketSniffer)
+	closed        bool
 }
 
-// PacketSnifferPool is a full-cone udp conn pool
 type PacketSnifferPool struct {
-	pool        sync.Map
-	createMuMap sync.Map
+	pool      sync.Map
+	createMu  sync.Mutex
+	active    atomic.Int64
+	maxActive int64
 }
+
 type PacketSnifferOptions struct {
-	Ttl time.Duration
+	Timeout   time.Duration
+	OnTimeout func(*PacketSniffer)
 }
+
 type PacketSnifferKey struct {
 	LAddr netip.AddrPort
 	RAddr netip.AddrPort
@@ -40,65 +53,135 @@ type PacketSnifferKey struct {
 var DefaultPacketSnifferSessionMgr = NewPacketSnifferPool()
 
 func NewPacketSnifferPool() *PacketSnifferPool {
-	return &PacketSnifferPool{}
+	return newPacketSnifferPool(MaxActiveQuicSniffers)
 }
 
-func (p *PacketSnifferPool) Remove(key PacketSnifferKey, sniffer *PacketSniffer) (err error) {
-	if ue, ok := p.pool.LoadAndDelete(key); ok {
-		sniffer.Close()
-		if ue != sniffer {
-			return fmt.Errorf("target udp endpoint is not in the pool")
-		}
+func newPacketSnifferPool(maxActive int64) *PacketSnifferPool {
+	return &PacketSnifferPool{maxActive: maxActive}
+}
+
+func (p *PacketSnifferPool) Remove(key PacketSnifferKey, sniffer *PacketSniffer) error {
+	sniffer.Mu.Lock()
+	defer sniffer.Mu.Unlock()
+	if !p.removeLocked(key, sniffer) {
+		return fmt.Errorf("packet sniffer is not in the pool")
 	}
-	return nil
+	sniffer.releaseHeldLocked()
+	return sniffer.closeLocked()
+}
+
+func (p *PacketSnifferPool) removeLocked(key PacketSnifferKey, sniffer *PacketSniffer) bool {
+	if !p.pool.CompareAndDelete(key, sniffer) {
+		return false
+	}
+	p.active.Add(-1)
+	if sniffer.deadlineTimer != nil {
+		sniffer.deadlineTimer.Stop()
+		sniffer.deadlineTimer = nil
+	}
+	return true
 }
 
 func (p *PacketSnifferPool) Get(key PacketSnifferKey) *PacketSniffer {
-	_qs, ok := p.pool.Load(key)
+	value, ok := p.pool.Load(key)
 	if !ok {
 		return nil
 	}
-	return _qs.(*PacketSniffer)
+	return value.(*PacketSniffer)
 }
 
-func (p *PacketSnifferPool) GetOrCreate(key PacketSnifferKey, createOption *PacketSnifferOptions) (qs *PacketSniffer, isNew bool) {
-	_qs, ok := p.pool.Load(key)
-begin:
-	if !ok {
-		createMu, _ := p.createMuMap.LoadOrStore(key, &sync.Mutex{})
-		createMu.(*sync.Mutex).Lock()
-		defer createMu.(*sync.Mutex).Unlock()
-		defer p.createMuMap.Delete(key)
-		_qs, ok = p.pool.Load(key)
-		if ok {
-			goto begin
-		}
-		// Create an PacketSniffer.
-		if createOption == nil {
-			createOption = &PacketSnifferOptions{}
-		}
-		if createOption.Ttl == 0 {
-			createOption.Ttl = PacketSnifferTtl
-		}
-
-		qs = &PacketSniffer{
-			Sniffer:       sniffing.NewPacketSniffer(nil, createOption.Ttl),
-			Mu:            sync.Mutex{},
-			deadlineTimer: nil,
-		}
-		qs.deadlineTimer = time.AfterFunc(createOption.Ttl, func() {
-			if _qs, ok := p.pool.LoadAndDelete(key); ok {
-				if _qs.(*PacketSniffer) == qs {
-					qs.Close()
-				} else {
-					// FIXME: ?
-				}
-			}
-		})
-		_qs = qs
-		p.pool.Store(key, qs)
-		// Receive UDP messages.
-		isNew = true
+func (p *PacketSnifferPool) GetOrCreate(key PacketSnifferKey, options *PacketSnifferOptions) (*PacketSniffer, bool) {
+	if value, ok := p.pool.Load(key); ok {
+		return value.(*PacketSniffer), false
 	}
-	return _qs.(*PacketSniffer), isNew
+
+	p.createMu.Lock()
+	defer p.createMu.Unlock()
+
+	if value, ok := p.pool.Load(key); ok {
+		return value.(*PacketSniffer), false
+	}
+	if p.maxActive > 0 && p.active.Load() >= p.maxActive {
+		return nil, false
+	}
+	if options == nil || options.Timeout <= 0 {
+		return nil, false
+	}
+
+	sniffer := &PacketSniffer{
+		Sniffer:   sniffing.NewQuicSniffer(),
+		onTimeout: options.OnTimeout,
+	}
+	// Publish the session while holding its mutex so consumers cannot finish it
+	// before the expiry timer has been installed.
+	sniffer.Mu.Lock()
+	sniffer.deadlineTimer = time.AfterFunc(options.Timeout, func() {
+		if sniffer.onTimeout != nil {
+			sniffer.onTimeout(sniffer)
+			return
+		}
+		putHeldPackets(p.expire(key, sniffer))
+	})
+	p.active.Add(1)
+	p.pool.Store(key, sniffer)
+	sniffer.Mu.Unlock()
+	return sniffer, true
+}
+
+func (p *PacketSnifferPool) expire(key PacketSnifferKey, sniffer *PacketSniffer) []pool.PB {
+	sniffer.Mu.Lock()
+	defer sniffer.Mu.Unlock()
+	if !p.removeLocked(key, sniffer) {
+		return nil
+	}
+	packets := sniffer.takeHeldLocked()
+	_ = sniffer.closeLocked()
+	return packets
+}
+
+func (s *PacketSniffer) HoldLocked(data []byte) error {
+	if s.closed {
+		return fmt.Errorf("packet sniffer is closed")
+	}
+	if len(s.heldPackets) >= MaxQuicHeldDatagrams || len(data) > MaxQuicHeldBytes-s.heldBytes {
+		return fmt.Errorf("quic held packet limit exceeded")
+	}
+	packet := pool.Get(len(data))
+	copy(packet, data)
+	s.heldPackets = append(s.heldPackets, packet)
+	s.heldBytes += len(packet)
+	return nil
+}
+
+func (s *PacketSniffer) TakeHeldLocked() []pool.PB {
+	return s.takeHeldLocked()
+}
+
+func (s *PacketSniffer) takeHeldLocked() []pool.PB {
+	packets := s.heldPackets
+	s.heldPackets = nil
+	s.heldBytes = 0
+	return packets
+}
+
+func (s *PacketSniffer) releaseHeldLocked() {
+	putHeldPackets(s.takeHeldLocked())
+}
+
+func (s *PacketSniffer) closeLocked() error {
+	if s.closed {
+		return nil
+	}
+	s.closed = true
+	if s.deadlineTimer != nil {
+		s.deadlineTimer.Stop()
+		s.deadlineTimer = nil
+	}
+	return s.Sniffer.Close()
+}
+
+func putHeldPackets(packets []pool.PB) {
+	for _, packet := range packets {
+		packet.Put()
+	}
 }

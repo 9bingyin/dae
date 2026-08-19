@@ -61,9 +61,53 @@ func sendPkt(log *logrus.Logger, data []byte, from netip.AddrPort, realTo, to ne
 	return err
 }
 
-func (c *ControlPlane) handlePkt(lConn *net.UDPConn, data []byte, src, pktDst, realDst netip.AddrPort, routingResult *bpfRoutingResult, skipSniffing bool) (err error) {
+func (c *ControlPlane) quicTimeoutHandler(key PacketSnifferKey, lConn *net.UDPConn, src, pktDst, realDst netip.AddrPort, routingResult bpfRoutingResult) func(*PacketSniffer) {
+	return func(sniffer *PacketSniffer) {
+		accepted := DefaultUdpTaskPool.TryEmitTask(src.String(), func() {
+			packets := DefaultPacketSnifferSessionMgr.expire(key, sniffer)
+			if len(packets) == 0 {
+				return
+			}
+			select {
+			case <-c.ctx.Done():
+				putHeldPackets(packets)
+				return
+			default:
+			}
+			if err := flushQuicPacketBatch(packets, nil, func(packet []byte) error {
+				return c.handlePkt(lConn, packet, src, pktDst, realDst, &routingResult, true, "")
+			}); err != nil {
+				c.log.WithError(err).Debug("flush expired quic packet")
+			}
+		})
+		if !accepted {
+			putHeldPackets(DefaultPacketSnifferSessionMgr.expire(key, sniffer))
+		}
+	}
+}
+
+func (c *ControlPlane) flushHeldQuicPackets(lConn *net.UDPConn, heldPackets []pool.PB, current []byte, src, pktDst, realDst netip.AddrPort, routingResult *bpfRoutingResult, domain string) error {
+	return flushQuicPacketBatch(heldPackets, current, func(packet []byte) error {
+		return c.handlePkt(lConn, packet, src, pktDst, realDst, routingResult, true, domain)
+	})
+}
+
+func flushQuicPacketBatch(heldPackets []pool.PB, current []byte, send func([]byte) error) error {
+	defer putHeldPackets(heldPackets)
+	for _, packet := range heldPackets {
+		if err := send(packet); err != nil {
+			return err
+		}
+	}
+	if current != nil {
+		return send(current)
+	}
+	return nil
+}
+
+func (c *ControlPlane) handlePkt(lConn *net.UDPConn, data []byte, src, pktDst, realDst netip.AddrPort, routingResult *bpfRoutingResult, skipSniffing bool, sniffedDomain string) (err error) {
 	var realSrc netip.AddrPort
-	var domain string
+	domain := sniffedDomain
 	realSrc = src
 	ue, ueExists := DefaultUdpEndpointPool.Get(realSrc)
 	if ueExists && ue.SniffedDomain != "" {
@@ -100,51 +144,61 @@ func (c *ControlPlane) handlePkt(lConn *net.UDPConn, data []byte, src, pktDst, r
 	dnsMessage, natTimeout := ChooseNatTimeout(data, realDst.Port() == 53)
 	// We should cache DNS records and set record TTL to 0, in order to monitor the dns req and resp in real time.
 	isDns := dnsMessage != nil
-	if !isDns && !skipSniffing && !ueExists {
-		// Sniff Quic, ...
-		key := PacketSnifferKey{
-			LAddr: realSrc,
-			RAddr: realDst,
-		}
-		_sniffer, _ := DefaultPacketSnifferSessionMgr.GetOrCreate(key, nil)
-		_sniffer.Mu.Lock()
-		// Re-get sniffer from pool to confirm the transaction is not done.
+	if !isDns && !skipSniffing && !ueExists && c.sniffingTimeout > 0 {
+		key := PacketSnifferKey{LAddr: realSrc, RAddr: realDst}
 		sniffer := DefaultPacketSnifferSessionMgr.Get(key)
-		if _sniffer == sniffer {
-			sniffer.AppendData(data)
-			domain, err = sniffer.SniffUdp()
-			if err != nil && !sniffing.IsSniffingError(err) {
-				sniffer.Mu.Unlock()
-				return err
+		if sniffer != nil || sniffing.IsLikelyQuicInitial(data) {
+			if sniffer == nil {
+				routingResultCopy := *routingResult
+				sniffer, _ = DefaultPacketSnifferSessionMgr.GetOrCreate(key, &PacketSnifferOptions{
+					Timeout:   c.sniffingTimeout,
+					OnTimeout: c.quicTimeoutHandler(key, lConn, src, pktDst, realDst, routingResultCopy),
+				})
 			}
-			if sniffer.NeedMore() {
-				sniffer.Mu.Unlock()
-				return nil
-			}
-			if err != nil {
-				logrus.WithError(err).
-					WithField("from", realSrc).
-					WithField("to", realDst).
-					Trace("sniffUdp")
-			}
-			defer DefaultPacketSnifferSessionMgr.Remove(key, sniffer)
-			// Re-handlePkt after self func.
-			toRehandle := sniffer.Data()[1 : len(sniffer.Data())-1] // Skip the first empty and the last (self).
-			sniffer.Mu.Unlock()
-			if len(toRehandle) > 0 {
-				defer func() {
-					if err == nil {
-						for _, d := range toRehandle {
-							dCopy := pool.Get(len(d))
-							copy(dCopy, d)
-							go c.handlePkt(lConn, dCopy, src, pktDst, realDst, routingResult, true)
+
+			if sniffer != nil {
+				sniffer.Mu.Lock()
+				if DefaultPacketSnifferSessionMgr.Get(key) == sniffer {
+					result := sniffer.Sniffer.Feed(data)
+					if result.State == sniffing.QuicSniffNeedMore {
+						if holdErr := sniffer.HoldLocked(data); holdErr == nil {
+							sniffer.Mu.Unlock()
+							return nil
+						} else {
+							result.State = sniffing.QuicSniffResourceLimit
+							result.Err = holdErr
 						}
 					}
-				}()
+
+					heldPackets := sniffer.TakeHeldLocked()
+					removed := DefaultPacketSnifferSessionMgr.removeLocked(key, sniffer)
+					closeErr := sniffer.closeLocked()
+					sniffer.Mu.Unlock()
+					if closeErr != nil {
+						putHeldPackets(heldPackets)
+						return closeErr
+					}
+					if removed {
+						if result.State == sniffing.QuicSniffFound {
+							domain = result.Domain
+						}
+						if result.Err != nil && c.log.IsLevelEnabled(logrus.TraceLevel) {
+							c.log.WithError(result.Err).
+								WithField("from", realSrc).
+								WithField("to", realDst).
+								WithField("state", result.State).
+								Trace("sniff quic")
+						}
+						if len(heldPackets) > 0 {
+							return c.flushHeldQuicPackets(lConn, heldPackets, data, src, pktDst, realDst, routingResult, domain)
+						}
+					} else {
+						putHeldPackets(heldPackets)
+					}
+				} else {
+					sniffer.Mu.Unlock()
+				}
 			}
-		} else {
-			_sniffer.Mu.Unlock()
-			// sniffer may be nil.
 		}
 	}
 	if routingResult.Must > 0 {

@@ -57,8 +57,14 @@ func NewUdpTaskPool() *UdpTaskPool {
 	return p
 }
 
-// EmitTask: Make sure packets with the same key (4 tuples) will be sent in order.
+// EmitTask makes sure packets with the same key are sent in order.
 func (p *UdpTaskPool) EmitTask(key string, task UdpTask) {
+	_ = p.TryEmitTask(key, task)
+}
+
+// TryEmitTask reports whether task was accepted by the queue. Callers that
+// transfer ownership to a task can release it when the queue is already closed.
+func (p *UdpTaskPool) TryEmitTask(key string, task UdpTask) bool {
 	p.mu.Lock()
 	q, ok := p.m[key]
 	if !ok {
@@ -92,7 +98,9 @@ func (p *UdpTaskPool) EmitTask(key string, task UdpTask) {
 	// if task cannot be executed within 180s(DefaultNatTimeout), GC may be triggered, so skip the task when GC occurs
 	select {
 	case q.ch <- task:
+		return true
 	case <-q.ctx.Done():
+		return false
 	}
 }
 

@@ -10,23 +10,38 @@ import "fmt"
 type Version int
 
 const (
-	Version_Draft = iota
+	Version_Draft Version = iota
 	Version_V1
 	Version_V2
 )
 
+const (
+	VersionNumberV1 uint32 = 0x00000001
+	VersionNumberV2 uint32 = 0x6b3343cf
+)
+
 func ParseVersion(version uint32) (Version, error) {
 	switch version {
-	case 0x6b3343cf:
+	case VersionNumberV2:
 		return Version_V2, nil
-	case 1:
+	case VersionNumberV1:
 		return Version_V1, nil
 	default:
 		if (version & 0xff000000) == 0xff000000 {
 			return Version_Draft, nil
 		}
-		return 0, fmt.Errorf("unknown version")
+		return 0, fmt.Errorf("unknown quic version 0x%08x", version)
 	}
+}
+
+// InitialPacketType returns the unprotected Long Packet Type value.
+// RFC 9000 Section 17.2 defines 0b00 for QUIC v1. RFC 9369 Section 3.2
+// changes the QUIC v2 Initial value to 0b01.
+func (v Version) InitialPacketType() byte {
+	if v == Version_V2 {
+		return 0b01
+	}
+	return 0b00
 }
 
 func (v Version) InitialSalt() []byte {
@@ -44,9 +59,7 @@ func (v Version) InitialSalt() []byte {
 
 func (v Version) HpLabel() []byte {
 	switch v {
-	case Version_Draft:
-		fallthrough
-	case Version_V1:
+	case Version_Draft, Version_V1:
 		return []byte("quic hp")
 	case Version_V2:
 		return []byte("quicv2 hp")
@@ -54,11 +67,10 @@ func (v Version) HpLabel() []byte {
 		panic("unsupported quic version")
 	}
 }
+
 func (v Version) KeyLabel() []byte {
 	switch v {
-	case Version_Draft:
-		fallthrough
-	case Version_V1:
+	case Version_Draft, Version_V1:
 		return []byte("quic key")
 	case Version_V2:
 		return []byte("quicv2 key")
@@ -66,11 +78,10 @@ func (v Version) KeyLabel() []byte {
 		panic("unsupported quic version")
 	}
 }
+
 func (v Version) IvLabel() []byte {
 	switch v {
-	case Version_Draft:
-		fallthrough
-	case Version_V1:
+	case Version_Draft, Version_V1:
 		return []byte("quic iv")
 	case Version_V2:
 		return []byte("quicv2 iv")

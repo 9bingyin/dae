@@ -8,7 +8,9 @@ package control
 import (
 	"encoding/hex"
 	"net/netip"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/daeuniverse/dae/component/sniffing"
 )
@@ -18,50 +20,285 @@ var testPacketSnifferData = []string{
 	"ce0000000108e8da6ed9f385c987000044d0f34f94dcc26b99261ea264742abe4e552a146e16e89e4b7ef0ab3d6f3a34227b59742e4ba83a1e18cea494d2f67e469be4a7ff01334b151e9b7ca63b53735008eecc1f5c618419982292eca5731bb163ba81c1300e0bb99f2536d89ab0faf2dbd37ebfdb3d71f7343296a2190914bda556b8f9ccf5219964eb3cd373966fcfaca8a4735fb59fbaf69bbbdfc3a81b11570bb81fd3f5ef780fb7036e0666b997b0f4ed3305b68eafa1a99b3c8a6a2142ad9fe1e6b0a0eade6ace92b57416d4bf68fa2e9295bfc22757b0542ce91c8af3f547ef0ad385788db230a50158a0009fd95a7e8ee6e0dd11d6f9a906cbe8117e85bd507cdbd8f1a5a6cabf2617de7227d1ae8a8c6086b8ec325df90c0e16b37b4ed0ce617a00c7598a21924a19aec1b08c31b69430b23eefbe555ca2433431d28a4ffec548e463e8e6363b6b4fe9b8477c686c393571273c30b2e1785261faa0fd6f560c12418b27cd0491e013db5a8b3294e01a46a6e4c6b52e32756ab4be6f4ebc886c0c472d63f117ce30115182a97f1308c7f28989ce301cabced825154b0f4fa3bf4a55ce2f384ff11d9cbc0460d69db363664f92dc014bdb771b9b1e1ab6672c6da71c90aa514dcdc3a4ce45298bf9e5a395ebac3dff2a738c4b4690ee06fdab572a277addac7035d94afe794df05da75a56c79c37f42de1d727dc65e3060d9331e2fc82de2d7cef6cb9ae46f648b9930593975c35960b24deb770d5ee4332f8f57a05503399ca7bfdf7207f66a0f73d6b53269a944d5a3043b225adddfdd29d20ea8f500bb09ea3bb724083dd29ea8839e8192c4360ba3c5a6db0d695af5d357d6c4ed94aa28305033629201689764189774bbd4f0ae41b878b8f29a0fe0e124075ea08c5054871506a05be2f90e9ec0c2db48c0780580312e9ff4071054386e4206841f575f7ca06c228f7ee11e2333d08652b9b4f0b97f473a46a3d79c4f9a3416fb20fdbd88cacfa36f06fe1d73618195c6f0bf759a77c6a16b7e271c6cdb672ea53f6edfac860fcaf03313564abde1f66bca441d844d289a9e1025711c284f2c7c805353f2a89e9aeb52e3f452e879f0fafcdc0b48a0676afcf617a85037d991762664f6db64847eff2308447c4e8ea6688838bb7237a5fdfe0f1695afaa0bbb821b0004585adf151b029bd3458e28ba49dfc17eef1d2dd14ccda88d0848d4cd36d33cc5bab173c2448785ec1bdabc8873c904b95d7847d1b89857f2c7e078c6e2eb96029aa91c077e0efcf7b2ed2f30c7abc12189627793c7870dc0e70342cc27402ee1d6dec5ceea0ca06159002ea14a20c63b85689ed1840f404e46cb83d91c5e02f3ed938462364d3349f689310234083f7044e4b338ac54bed94530640d684c9688651b915d8c8895ef0f05f376292871b589751ac5b233e3d85572bb0c11bbbe91cc49a4ef0422f2676a2f3cc62bc88dbb7acf03cb5e847e976bfca6a90b9cee743ea77be5472ef162ff101c6873043df94c53c252840fd6a2662018f0897a06cd215997d6050917876500796fef718957212c773c39d1c7b839931af1e7dfae6e2c1d2251e78896521bb35b20057bad77df85aaed90288c17edb081398815e47239aeb77293a02a61a5125109fc3953593233fa83c17770a815fad7831c1b8647c6089ec621ee774a12a714def498d4335d0bb8a4a6a3dddead8ddb1176f58218477d55317df88cd2ca5a06b72679cf2ff7253ebd76a5ed3",
 }
 
-func TestPacketSniffer_Normal(t *testing.T) {
+func TestPacketSnifferNormal(t *testing.T) {
+	manager := NewPacketSnifferPool()
 	key := PacketSnifferKey{
 		LAddr: netip.MustParseAddrPort("1.1.1.1:1111"),
 		RAddr: netip.MustParseAddrPort("2.2.2.2:2222"),
 	}
-	for _, _data := range testPacketSnifferData {
-		data, _ := hex.DecodeString(_data)
-		sniffer, _ := DefaultPacketSnifferSessionMgr.GetOrCreate(key, nil)
-		sniffer.AppendData(data)
-		domain, err := sniffer.SniffUdp()
-		if err != nil && !sniffing.IsSniffingError(err) {
+
+	for i, encoded := range testPacketSnifferData {
+		data, err := hex.DecodeString(encoded)
+		if err != nil {
 			t.Fatal(err)
 		}
-		if sniffer.NeedMore() {
+		sniffer, _ := manager.GetOrCreate(key, &PacketSnifferOptions{Timeout: time.Second})
+		sniffer.Mu.Lock()
+		result := sniffer.Sniffer.Feed(data)
+		if result.State == sniffing.QuicSniffNeedMore {
+			if err := sniffer.HoldLocked(data); err != nil {
+				sniffer.Mu.Unlock()
+				t.Fatal(err)
+			}
+			sniffer.Mu.Unlock()
 			continue
 		}
-		if err := DefaultPacketSnifferSessionMgr.Remove(key, sniffer); err != nil {
-			t.Fatal(err)
+		packets := sniffer.TakeHeldLocked()
+		removed := manager.removeLocked(key, sniffer)
+		closeErr := sniffer.closeLocked()
+		sniffer.Mu.Unlock()
+		putHeldPackets(packets)
+		if !removed {
+			t.Fatal("sniffer was not removed")
 		}
-		t.Log(domain)
+		if closeErr != nil {
+			t.Fatal(closeErr)
+		}
+		if result.State != sniffing.QuicSniffFound || result.Domain != "i.ytimg.com" {
+			t.Fatalf("packet %d result = %+v", i, result)
+		}
 		return
 	}
-	t.Fatal("not found")
+	t.Fatal("domain not found")
 }
 
-func TestPacketSniffer_Mismatched(t *testing.T) {
-	dst := netip.MustParseAddrPort("2.2.2.2:2222")
-	for _, _data := range testPacketSnifferData {
-		data, _ := hex.DecodeString(_data)
-		sniffer, _ := DefaultPacketSnifferSessionMgr.GetOrCreate(PacketSnifferKey{
-			LAddr: netip.MustParseAddrPort("1.1.1.1:1111"),
-			RAddr: dst,
-		}, nil)
-		sniffer.AppendData(data)
-		domain, err := sniffer.SniffUdp()
-		if err != nil && !sniffing.IsSniffingError(err) {
+func TestPacketSnifferTimeoutReturnsHeldPacketsInOrder(t *testing.T) {
+	manager := NewPacketSnifferPool()
+	key := PacketSnifferKey{LAddr: netip.MustParseAddrPort("1.1.1.1:1111"), RAddr: netip.MustParseAddrPort("2.2.2.2:2222")}
+	timedOut := make(chan *PacketSniffer, 1)
+	sniffer, _ := manager.GetOrCreate(key, &PacketSnifferOptions{
+		Timeout: 10 * time.Millisecond,
+		OnTimeout: func(expired *PacketSniffer) {
+			timedOut <- expired
+		},
+	})
+	sniffer.Mu.Lock()
+	if err := sniffer.HoldLocked([]byte("first")); err != nil {
+		sniffer.Mu.Unlock()
+		t.Fatal(err)
+	}
+	if err := sniffer.HoldLocked([]byte("second")); err != nil {
+		sniffer.Mu.Unlock()
+		t.Fatal(err)
+	}
+	sniffer.Mu.Unlock()
+
+	var expired *PacketSniffer
+	select {
+	case expired = <-timedOut:
+	case <-time.After(time.Second):
+		t.Fatal("packet sniffer did not reach its deadline")
+	}
+	if got := manager.Get(key); got != sniffer {
+		t.Fatal("deadline callback removed the session outside the UDP task queue")
+	}
+	packets := manager.expire(key, expired)
+	values := make([]string, len(packets))
+	for i, packet := range packets {
+		values[i] = string(packet)
+	}
+	putHeldPackets(packets)
+	if len(values) != 2 || values[0] != "first" || values[1] != "second" {
+		t.Fatalf("timed out packets = %v", values)
+	}
+	if got := manager.Get(key); got != nil {
+		t.Fatal("expired packet sniffer remains in pool")
+	}
+}
+
+func TestPacketSnifferHeldPacketLimits(t *testing.T) {
+	manager := NewPacketSnifferPool()
+	key := PacketSnifferKey{LAddr: netip.MustParseAddrPort("1.1.1.1:1111"), RAddr: netip.MustParseAddrPort("2.2.2.2:2222")}
+	sniffer, _ := manager.GetOrCreate(key, &PacketSnifferOptions{Timeout: time.Hour})
+	sniffer.Mu.Lock()
+	for range MaxQuicHeldDatagrams {
+		if err := sniffer.HoldLocked([]byte{1}); err != nil {
+			sniffer.Mu.Unlock()
 			t.Fatal(err)
 		}
-		if sniffer.NeedMore() {
-			dst = netip.AddrPortFrom(dst.Addr(), dst.Port()+1)
-			continue
+	}
+	if err := sniffer.HoldLocked([]byte{1}); err == nil {
+		sniffer.Mu.Unlock()
+		t.Fatal("expected held datagram limit error")
+	}
+	sniffer.Mu.Unlock()
+	if err := manager.Remove(key, sniffer); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPacketSnifferRequiresTimeout(t *testing.T) {
+	manager := NewPacketSnifferPool()
+	key := PacketSnifferKey{LAddr: netip.MustParseAddrPort("1.1.1.1:1111"), RAddr: netip.MustParseAddrPort("2.2.2.2:2222")}
+
+	if sniffer, created := manager.GetOrCreate(key, nil); sniffer != nil || created {
+		t.Fatal("packet sniffer was created without a timeout")
+	}
+	if sniffer, created := manager.GetOrCreate(key, &PacketSnifferOptions{}); sniffer != nil || created {
+		t.Fatal("packet sniffer was created with a zero timeout")
+	}
+	if got := manager.active.Load(); got != 0 {
+		t.Fatalf("active packet sniffers = %d, want 0", got)
+	}
+}
+
+func TestPacketSnifferGlobalLimitFailsOpen(t *testing.T) {
+	manager := newPacketSnifferPool(1)
+	firstKey := PacketSnifferKey{LAddr: netip.MustParseAddrPort("1.1.1.1:1111"), RAddr: netip.MustParseAddrPort("2.2.2.2:2222")}
+	secondKey := PacketSnifferKey{LAddr: netip.MustParseAddrPort("1.1.1.1:1112"), RAddr: firstKey.RAddr}
+
+	first, created := manager.GetOrCreate(firstKey, &PacketSnifferOptions{Timeout: time.Hour})
+	if first == nil || !created {
+		t.Fatal("first packet sniffer was not created")
+	}
+	if got, created := manager.GetOrCreate(firstKey, nil); got != first || created {
+		t.Fatal("existing packet sniffer was rejected at the global limit")
+	}
+	if second, created := manager.GetOrCreate(secondKey, nil); second != nil || created {
+		t.Fatal("packet sniffer was created above the global limit")
+	}
+	if got := manager.active.Load(); got != 1 {
+		t.Fatalf("active packet sniffers = %d, want 1", got)
+	}
+
+	if err := manager.Remove(firstKey, first); err != nil {
+		t.Fatal(err)
+	}
+	second, created := manager.GetOrCreate(secondKey, &PacketSnifferOptions{Timeout: time.Hour})
+	if second == nil || !created {
+		t.Fatal("capacity was not released after removing the first packet sniffer")
+	}
+	if err := manager.Remove(secondKey, second); err != nil {
+		t.Fatal(err)
+	}
+	if got := manager.active.Load(); got != 0 {
+		t.Fatalf("active packet sniffers = %d, want 0", got)
+	}
+}
+
+func TestPacketSnifferStaleExpiryDoesNotDeleteReplacement(t *testing.T) {
+	manager := NewPacketSnifferPool()
+	key := PacketSnifferKey{LAddr: netip.MustParseAddrPort("1.1.1.1:1111"), RAddr: netip.MustParseAddrPort("2.2.2.2:2222")}
+	old, _ := manager.GetOrCreate(key, &PacketSnifferOptions{Timeout: time.Hour})
+	if err := manager.Remove(key, old); err != nil {
+		t.Fatal(err)
+	}
+	replacement, _ := manager.GetOrCreate(key, &PacketSnifferOptions{Timeout: time.Hour})
+
+	putHeldPackets(manager.expire(key, old))
+	if got := manager.Get(key); got != replacement {
+		t.Fatalf("replacement was removed by stale expiry: got %p, want %p", got, replacement)
+	}
+	if err := manager.Remove(key, replacement); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPacketSnifferGlobalLimitConcurrent(t *testing.T) {
+	const limit = 32
+	manager := newPacketSnifferPool(limit)
+	type session struct {
+		key     PacketSnifferKey
+		sniffer *PacketSniffer
+	}
+	sessions := make(chan session, limit)
+
+	var wg sync.WaitGroup
+	for i := range 256 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			key := PacketSnifferKey{
+				LAddr: netip.AddrPortFrom(netip.MustParseAddr("1.1.1.1"), uint16(1000+i)),
+				RAddr: netip.MustParseAddrPort("2.2.2.2:443"),
+			}
+			sniffer, created := manager.GetOrCreate(key, &PacketSnifferOptions{Timeout: time.Hour})
+			if created {
+				sessions <- session{key: key, sniffer: sniffer}
+			}
+		}()
+	}
+	wg.Wait()
+	close(sessions)
+
+	if got := manager.active.Load(); got != limit {
+		t.Fatalf("active packet sniffers = %d, want %d", got, limit)
+	}
+	for session := range sessions {
+		if err := manager.Remove(session.key, session.sniffer); err != nil {
+			t.Fatal(err)
 		}
-		sniffer.Close()
-		t.Fatal("unexpected found", domain)
-		return
+	}
+	if got := manager.active.Load(); got != 0 {
+		t.Fatalf("active packet sniffers after cleanup = %d, want 0", got)
+	}
+}
+
+func BenchmarkPacketSnifferPartialInitialLifecycle(b *testing.B) {
+	data, err := hex.DecodeString(testPacketSnifferData[0])
+	if err != nil {
+		b.Fatal(err)
+	}
+	manager := newPacketSnifferPool(1)
+	key := PacketSnifferKey{LAddr: netip.MustParseAddrPort("1.1.1.1:1111"), RAddr: netip.MustParseAddrPort("2.2.2.2:2222")}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		sniffer, created := manager.GetOrCreate(key, &PacketSnifferOptions{Timeout: time.Hour})
+		if sniffer == nil || !created {
+			b.Fatal("packet sniffer was not created")
+		}
+		sniffer.Mu.Lock()
+		result := sniffer.Sniffer.Feed(data)
+		if result.State != sniffing.QuicSniffNeedMore {
+			sniffer.Mu.Unlock()
+			b.Fatalf("state = %v, want %v", result.State, sniffing.QuicSniffNeedMore)
+		}
+		if err := sniffer.HoldLocked(data); err != nil {
+			sniffer.Mu.Unlock()
+			b.Fatal(err)
+		}
+		sniffer.Mu.Unlock()
+		if err := manager.Remove(key, sniffer); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func TestPacketSnifferDifferentKeysDoNotShareState(t *testing.T) {
+	manager := NewPacketSnifferPool()
+	firstData, err := hex.DecodeString(testPacketSnifferData[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondData, err := hex.DecodeString(testPacketSnifferData[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	firstKey := PacketSnifferKey{LAddr: netip.MustParseAddrPort("1.1.1.1:1111"), RAddr: netip.MustParseAddrPort("2.2.2.2:2222")}
+	secondKey := PacketSnifferKey{LAddr: firstKey.LAddr, RAddr: netip.MustParseAddrPort("2.2.2.2:2223")}
+	first, _ := manager.GetOrCreate(firstKey, &PacketSnifferOptions{Timeout: time.Second})
+	second, _ := manager.GetOrCreate(secondKey, &PacketSnifferOptions{Timeout: time.Second})
+
+	first.Mu.Lock()
+	firstResult := first.Sniffer.Feed(firstData)
+	first.Mu.Unlock()
+	second.Mu.Lock()
+	secondResult := second.Sniffer.Feed(secondData)
+	second.Mu.Unlock()
+
+	if firstResult.State != sniffing.QuicSniffNeedMore {
+		t.Fatalf("first state = %v", firstResult.State)
+	}
+	if secondResult.State == sniffing.QuicSniffFound {
+		t.Fatalf("different key unexpectedly completed ClientHello: %+v", secondResult)
+	}
+	if err := manager.Remove(firstKey, first); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Remove(secondKey, second); err != nil {
+		t.Fatal(err)
 	}
 }

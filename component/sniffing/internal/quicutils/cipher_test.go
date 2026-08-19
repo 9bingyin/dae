@@ -64,6 +64,28 @@ func TestKeys_HeaderProtection_(t *testing.T) {
 	}
 }
 
+func TestDecodePacketNumber(t *testing.T) {
+	tests := []struct {
+		name       string
+		largest    uint64
+		hasLargest bool
+		truncated  uint64
+		length     int
+		want       uint64
+	}{
+		{name: "first packet", truncated: 2, length: 1, want: 2},
+		{name: "same window", largest: 0xaa82f30e, hasLargest: true, truncated: 0x9b32, length: 2, want: 0xaa829b32},
+		{name: "next window", largest: 0xaa82f30e, hasLargest: true, truncated: 0x1f94, length: 2, want: 0xaa831f94},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := decodePacketNumber(test.largest, test.hasLargest, test.truncated, test.length); got != test.want {
+				t.Fatalf("packet number = %#x, want %#x", got, test.want)
+			}
+		})
+	}
+}
+
 func TestKeys_PayloadDecrypt_(t *testing.T) {
 	destConnId, _ := hex.DecodeString("7f9863b69d513af6a050f0272dfe4dd1")
 	keys, err := NewKeys(destConnId, Version_Draft, common.NewGcm)

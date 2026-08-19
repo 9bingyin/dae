@@ -13,7 +13,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/daeuniverse/dae/component/sniffing/internal/quicutils"
 	"github.com/daeuniverse/outbound/pool"
 	"github.com/daeuniverse/outbound/pool/bytes"
 )
@@ -31,12 +30,6 @@ type Sniffer struct {
 	readMu  sync.Mutex
 	ctx     context.Context
 	cancel  func()
-
-	// Packet
-	data         [][]byte
-	needMore     bool
-	quicNextRead int
-	quicCryptos  []*quicutils.CryptoFrameOffset
 }
 
 func NewStreamSniffer(r io.Reader, timeout time.Duration) *Sniffer {
@@ -48,22 +41,6 @@ func NewStreamSniffer(r io.Reader, timeout time.Duration) *Sniffer {
 		stream:    true,
 		r:         r,
 		buf:       buffer,
-		dataReady: make(chan struct{}),
-		ctx:       ctx,
-		cancel:    cancel,
-	}
-	return s
-}
-
-func NewPacketSniffer(data []byte, timeout time.Duration) *Sniffer {
-	buffer := pool.GetBuffer()
-	buffer.Write(data)
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	s := &Sniffer{
-		stream:    false,
-		r:         nil,
-		buf:       buffer,
-		data:      [][]byte{buffer.Bytes()},
 		dataReady: make(chan struct{}),
 		ctx:       ctx,
 		cancel:    cancel,
@@ -143,54 +120,6 @@ func (s *Sniffer) SniffTcp() (d string, err error) {
 		}
 		return d, err
 	}
-}
-
-func (s *Sniffer) SniffUdp() (d string, err error) {
-	if s.sniffed != "" {
-		return s.sniffed, nil
-	}
-	defer func() {
-		if err == nil {
-			s.sniffed = d
-		}
-	}()
-	defer func() {
-		if err == nil {
-			s.sniffed = d
-		}
-	}()
-	s.readMu.Lock()
-	defer s.readMu.Unlock()
-
-	// Always ready.
-	select {
-	case <-s.dataReady:
-	default:
-		close(s.dataReady)
-	}
-
-	if s.buf.Len() == 0 {
-		return "", ErrNotApplicable
-	}
-
-	return sniffGroup(
-		s.SniffQuic,
-	)
-}
-
-func (s *Sniffer) AppendData(data []byte) {
-	s.needMore = false
-	ori := s.buf.Len()
-	s.buf.Write(data)
-	s.data = append(s.data, s.buf.Bytes()[ori:])
-}
-
-func (s *Sniffer) Data() [][]byte {
-	return s.data
-}
-
-func (s *Sniffer) NeedMore() bool {
-	return s.needMore
 }
 
 func (s *Sniffer) Read(p []byte) (n int, err error) {

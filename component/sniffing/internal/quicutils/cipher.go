@@ -10,9 +10,9 @@ import (
 	"crypto/cipher"
 	"crypto/sha256"
 	"encoding/binary"
+	"fmt"
 	"io"
 
-	"github.com/daeuniverse/dae/common"
 	"github.com/daeuniverse/outbound/pool"
 	"golang.org/x/crypto/hkdf"
 )
@@ -22,11 +22,10 @@ const (
 
 	MaxPacketNumberLength = 4
 	SampleSize            = 16
+	maxPacketNumber       = uint64(1)<<62 - 1
 )
 
-var (
-	InitialClientLabel = []byte("client in")
-)
+var InitialClientLabel = []byte("client in")
 
 type Keys struct {
 	version             Version
@@ -38,131 +37,195 @@ type Keys struct {
 }
 
 func (k *Keys) Close() error {
+	if k == nil {
+		return nil
+	}
 	pool.Put(k.clientInitialSecret)
 	pool.Put(k.headerProtectionKey)
 	pool.Put(k.iv)
 	pool.Put(k.key)
+	k.clientInitialSecret = nil
+	k.headerProtectionKey = nil
+	k.iv = nil
+	k.key = nil
 	return nil
 }
 
-func NewKeys(clientDstConnectionId []byte, version Version, newAead func(key []byte) (cipher.AEAD, error)) (keys *Keys, err error) {
-	// https://datatracker.ietf.org/doc/html/rfc9001#name-keys
-	initialSecret := hkdf.Extract(sha256.New, clientDstConnectionId, version.InitialSalt())
+func NewKeys(clientDstConnectionID []byte, version Version, newAead func(key []byte) (cipher.AEAD, error)) (*Keys, error) {
+	// RFC 9001 Section 5.2 derives Initial secrets from the Destination
+	// Connection ID in the client's first Initial packet.
+	initialSecret := hkdf.Extract(sha256.New, clientDstConnectionID, version.InitialSalt())
 	clientInitialSecret, err := HkdfExpandLabelFromPool(sha256.New, initialSecret, InitialClientLabel, nil, 32)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("expand client initial secret: %w", err)
 	}
 
-	keys = &Keys{
+	keys := &Keys{
 		clientInitialSecret: clientInitialSecret,
 		version:             version,
 		newAead:             newAead,
 	}
-	// We differentiated a deriveKeys func is just for example test.
-	if err = keys.deriveKeys(); err != nil {
-		keys.Close()
+	if err := keys.deriveKeys(); err != nil {
+		_ = keys.Close()
 		return nil, err
 	}
-
 	return keys, nil
 }
 
-func (k *Keys) deriveKeys() (err error) {
+func (k *Keys) deriveKeys() error {
+	var err error
 	k.key, err = HkdfExpandLabelFromPool(sha256.New, k.clientInitialSecret, k.version.KeyLabel(), nil, 16)
 	if err != nil {
-		return err
+		return fmt.Errorf("expand packet protection key: %w", err)
 	}
 	k.iv, err = HkdfExpandLabelFromPool(sha256.New, k.clientInitialSecret, k.version.IvLabel(), nil, 12)
 	if err != nil {
-		return err
+		return fmt.Errorf("expand packet protection iv: %w", err)
 	}
 	k.headerProtectionKey, err = HkdfExpandLabelFromPool(sha256.New, k.clientInitialSecret, k.version.HpLabel(), nil, 16)
 	if err != nil {
-		return err
+		return fmt.Errorf("expand header protection key: %w", err)
 	}
 	return nil
 }
 
-// HeaderProtection_ encrypt/decrypt firstByte and packetNumber in place.
-func (k *Keys) HeaderProtection_(sample []byte, longHeader bool, firstByte *byte, potentialPacketNumber []byte) (packetNumber []byte, err error) {
+// HeaderProtection_ removes QUIC header protection in place. It is kept as a
+// small primitive for RFC test vectors; production parsing uses DecryptInitial.
+func (k *Keys) HeaderProtection_(sample []byte, longHeader bool, firstByte *byte, potentialPacketNumber []byte) ([]byte, error) {
+	if len(sample) < SampleSize || len(potentialPacketNumber) < MaxPacketNumberLength {
+		return nil, io.ErrUnexpectedEOF
+	}
 	block, err := aes.NewCipher(k.headerProtectionKey)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("create header protection cipher: %w", err)
 	}
-	// Get mask.
-	mask := pool.Get(block.BlockSize())
-	defer pool.Put(mask)
-	block.Encrypt(mask, sample)
-	// Encrypt/decrypt first byte.
+	var mask [aes.BlockSize]byte
+	block.Encrypt(mask[:], sample[:SampleSize])
 	if longHeader {
-		// Long header: 4 bits masked
-		// High 4 bits are not protected.
 		*firstByte ^= mask[0] & 0x0f
 	} else {
-		// Short header: 5 bits masked
-		// High 3 bits are not protected.
 		*firstByte ^= mask[0] & 0x1f
 	}
-	// The length of the Packet Number field is the value of this field plus one.
-	packetNumberLength := int((*firstByte & 0b11) + 1)
-	packetNumber = potentialPacketNumber[:packetNumberLength]
-
-	// Encrypt/decrypt packet number.
+	packetNumberLength := int(*firstByte&0b11) + 1
+	packetNumber := potentialPacketNumber[:packetNumberLength]
 	for i := range packetNumber {
 		packetNumber[i] ^= mask[1+i]
 	}
 	return packetNumber, nil
 }
 
-func (k *Keys) PayloadDecrypt(ciphertext []byte, packetNumber []byte, header []byte) (plaintext []byte, err error) {
-	// https://datatracker.ietf.org/doc/html/rfc9001#name-initial-secrets
-
+// PayloadDecrypt decrypts a payload for RFC test vectors. packetNumber must
+// contain the full packet number in network byte order.
+func (k *Keys) PayloadDecrypt(ciphertext, packetNumber, header []byte) ([]byte, error) {
 	aead, err := k.newAead(k.key)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("create packet protection cipher: %w", err)
 	}
-	// We only decrypt once, so we do not need to XOR it back.
-	// https://github.com/quic-go/qtls-go1-20/blob/e132a0e6cb45e20ac0b705454849a11d09ba5a54/cipher_suites.go#L496
-	for i := range packetNumber {
-		k.iv[len(k.iv)-len(packetNumber)+i] ^= packetNumber[i]
+	if len(ciphertext) < aead.Overhead() || len(packetNumber) > 8 {
+		return nil, io.ErrUnexpectedEOF
 	}
-	plaintext = make([]byte, len(ciphertext)-aead.Overhead())
-	plaintext, err = aead.Open(plaintext[:0], k.iv, ciphertext, header)
+	var number uint64
+	for _, b := range packetNumber {
+		number = number<<8 | uint64(b)
+	}
+	nonce := make([]byte, len(k.iv))
+	copy(nonce, k.iv)
+	var encoded [8]byte
+	binary.BigEndian.PutUint64(encoded[:], number)
+	for i := range encoded {
+		nonce[len(nonce)-len(encoded)+i] ^= encoded[i]
+	}
+	plaintext, err := aead.Open(nil, nonce, ciphertext, header)
 	if err != nil {
-		// Do nothing.
+		return nil, fmt.Errorf("decrypt payload: %w", err)
 	}
 	return plaintext, nil
 }
 
-func DecryptQuic_(header []byte, blockEnd int, destConnId []byte) (plaintext []byte, err error) {
-	_version := binary.BigEndian.Uint32(header[1:])
-	version, err := ParseVersion(_version)
-	if err != nil {
-		return nil, err
-	}
-	keys, err := NewKeys(destConnId, version, common.NewGcm)
-	if err != nil {
-		return nil, err
-	}
-	defer keys.Close()
-	if blockEnd-len(header) < SampleSize {
-		return nil, io.ErrUnexpectedEOF
-	}
-	// Sample 16B
-	sample := header[len(header) : len(header)+SampleSize]
-
-	// Decrypt header flag and packet number.
-	var packetNumber []byte
-	if packetNumber, err = keys.HeaderProtection_(sample, true, &header[0], header[len(header)-MaxPacketNumberLength:]); err != nil {
-		return nil, err
-	}
-	header = header[:len(header)-MaxPacketNumberLength+len(packetNumber)] // Correct header
-	payload := header[len(header):blockEnd]                               // Correct payload
-
-	plaintext, err = keys.PayloadDecrypt(payload, packetNumber, header)
-	if err != nil {
-		return nil, err
+// DecryptInitial decrypts one client Initial packet. packetNumberOffset points
+// to the first protected packet-number byte, and packetEnd is the end selected
+// by the QUIC Length field. RFC 9001 Sections 5.3 and 5.4 define the nonce and
+// header-protection operations.
+func (k *Keys) DecryptInitial(packet []byte, packetNumberOffset, packetEnd int, largestPacketNumber uint64, hasLargest bool) ([]byte, uint64, error) {
+	if packetNumberOffset < 0 || packetEnd > len(packet) || packetNumberOffset >= packetEnd {
+		return nil, 0, io.ErrUnexpectedEOF
 	}
 
-	return plaintext, nil
+	sampleStart := packetNumberOffset + MaxPacketNumberLength
+	if sampleStart > packetEnd || packetEnd-sampleStart < SampleSize {
+		return nil, 0, io.ErrUnexpectedEOF
+	}
+
+	block, err := aes.NewCipher(k.headerProtectionKey)
+	if err != nil {
+		return nil, 0, fmt.Errorf("create header protection cipher: %w", err)
+	}
+	var mask [aes.BlockSize]byte
+	block.Encrypt(mask[:], packet[sampleStart:sampleStart+SampleSize])
+
+	firstByte := packet[0] ^ mask[0]&0x0f
+	packetNumberLength := int(firstByte&0b11) + 1
+	if packetNumberOffset+packetNumberLength > packetEnd {
+		return nil, 0, io.ErrUnexpectedEOF
+	}
+
+	var truncatedPacketNumber uint64
+	for i := 0; i < packetNumberLength; i++ {
+		truncatedPacketNumber = truncatedPacketNumber<<8 | uint64(packet[packetNumberOffset+i]^mask[1+i])
+	}
+	packetNumber := decodePacketNumber(largestPacketNumber, hasLargest, truncatedPacketNumber, packetNumberLength)
+
+	headerLength := packetNumberOffset + packetNumberLength
+	header := make([]byte, headerLength)
+	copy(header, packet[:headerLength])
+	header[0] = firstByte
+	for i := 0; i < packetNumberLength; i++ {
+		shift := 8 * (packetNumberLength - 1 - i)
+		header[packetNumberOffset+i] = byte(packetNumber >> shift)
+	}
+
+	aead, err := k.newAead(k.key)
+	if err != nil {
+		return nil, 0, fmt.Errorf("create packet protection cipher: %w", err)
+	}
+	ciphertext := packet[headerLength:packetEnd]
+	if len(ciphertext) < aead.Overhead() {
+		return nil, 0, io.ErrUnexpectedEOF
+	}
+
+	nonce := make([]byte, len(k.iv))
+	copy(nonce, k.iv)
+	var encodedPacketNumber [8]byte
+	binary.BigEndian.PutUint64(encodedPacketNumber[:], packetNumber)
+	for i := range encodedPacketNumber {
+		nonce[len(nonce)-len(encodedPacketNumber)+i] ^= encodedPacketNumber[i]
+	}
+
+	plaintext, err := aead.Open(nil, nonce, ciphertext, header)
+	if err != nil {
+		return nil, 0, fmt.Errorf("decrypt initial payload: %w", err)
+	}
+	return plaintext, packetNumber, nil
+}
+
+// decodePacketNumber implements RFC 9000 Appendix A.3.
+func decodePacketNumber(largest uint64, hasLargest bool, truncated uint64, packetNumberLength int) uint64 {
+	var expected uint64
+	if hasLargest {
+		expected = largest + 1
+	}
+
+	packetNumberBits := uint(packetNumberLength * 8)
+	packetNumberWindow := uint64(1) << packetNumberBits
+	packetNumberHalfWindow := packetNumberWindow / 2
+	packetNumberMask := packetNumberWindow - 1
+	candidate := expected&^packetNumberMask | truncated
+
+	if candidate <= maxPacketNumber-packetNumberWindow && candidate+packetNumberHalfWindow <= expected {
+		return candidate + packetNumberWindow
+	}
+	if candidate > expected+packetNumberHalfWindow && candidate >= packetNumberWindow {
+		return candidate - packetNumberWindow
+	}
+	return candidate
 }
