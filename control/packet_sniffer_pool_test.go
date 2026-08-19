@@ -8,7 +8,6 @@ package control
 import (
 	"encoding/hex"
 	"net/netip"
-	"sync"
 	"testing"
 	"time"
 
@@ -137,43 +136,6 @@ func TestPacketSnifferRequiresTimeout(t *testing.T) {
 	if sniffer, created := manager.GetOrCreate(key, &PacketSnifferOptions{}); sniffer != nil || created {
 		t.Fatal("packet sniffer was created with a zero timeout")
 	}
-	if got := manager.active.Load(); got != 0 {
-		t.Fatalf("active packet sniffers = %d, want 0", got)
-	}
-}
-
-func TestPacketSnifferGlobalLimitFailsOpen(t *testing.T) {
-	manager := newPacketSnifferPool(1)
-	firstKey := PacketSnifferKey{LAddr: netip.MustParseAddrPort("1.1.1.1:1111"), RAddr: netip.MustParseAddrPort("2.2.2.2:2222")}
-	secondKey := PacketSnifferKey{LAddr: netip.MustParseAddrPort("1.1.1.1:1112"), RAddr: firstKey.RAddr}
-
-	first, created := manager.GetOrCreate(firstKey, &PacketSnifferOptions{Timeout: time.Hour})
-	if first == nil || !created {
-		t.Fatal("first packet sniffer was not created")
-	}
-	if got, created := manager.GetOrCreate(firstKey, nil); got != first || created {
-		t.Fatal("existing packet sniffer was rejected at the global limit")
-	}
-	if second, created := manager.GetOrCreate(secondKey, nil); second != nil || created {
-		t.Fatal("packet sniffer was created above the global limit")
-	}
-	if got := manager.active.Load(); got != 1 {
-		t.Fatalf("active packet sniffers = %d, want 1", got)
-	}
-
-	if err := manager.Remove(firstKey, first); err != nil {
-		t.Fatal(err)
-	}
-	second, created := manager.GetOrCreate(secondKey, &PacketSnifferOptions{Timeout: time.Hour})
-	if second == nil || !created {
-		t.Fatal("capacity was not released after removing the first packet sniffer")
-	}
-	if err := manager.Remove(secondKey, second); err != nil {
-		t.Fatal(err)
-	}
-	if got := manager.active.Load(); got != 0 {
-		t.Fatalf("active packet sniffers = %d, want 0", got)
-	}
 }
 
 func TestPacketSnifferStaleExpiryDoesNotDeleteReplacement(t *testing.T) {
@@ -194,52 +156,12 @@ func TestPacketSnifferStaleExpiryDoesNotDeleteReplacement(t *testing.T) {
 	}
 }
 
-func TestPacketSnifferGlobalLimitConcurrent(t *testing.T) {
-	const limit = 32
-	manager := newPacketSnifferPool(limit)
-	type session struct {
-		key     PacketSnifferKey
-		sniffer *PacketSniffer
-	}
-	sessions := make(chan session, limit)
-
-	var wg sync.WaitGroup
-	for i := range 256 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			key := PacketSnifferKey{
-				LAddr: netip.AddrPortFrom(netip.MustParseAddr("1.1.1.1"), uint16(1000+i)),
-				RAddr: netip.MustParseAddrPort("2.2.2.2:443"),
-			}
-			sniffer, created := manager.GetOrCreate(key, &PacketSnifferOptions{Timeout: time.Hour})
-			if created {
-				sessions <- session{key: key, sniffer: sniffer}
-			}
-		}()
-	}
-	wg.Wait()
-	close(sessions)
-
-	if got := manager.active.Load(); got != limit {
-		t.Fatalf("active packet sniffers = %d, want %d", got, limit)
-	}
-	for session := range sessions {
-		if err := manager.Remove(session.key, session.sniffer); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if got := manager.active.Load(); got != 0 {
-		t.Fatalf("active packet sniffers after cleanup = %d, want 0", got)
-	}
-}
-
 func BenchmarkPacketSnifferPartialInitialLifecycle(b *testing.B) {
 	data, err := hex.DecodeString(testPacketSnifferData[0])
 	if err != nil {
 		b.Fatal(err)
 	}
-	manager := newPacketSnifferPool(1)
+	manager := NewPacketSnifferPool()
 	key := PacketSnifferKey{LAddr: netip.MustParseAddrPort("1.1.1.1:1111"), RAddr: netip.MustParseAddrPort("2.2.2.2:2222")}
 
 	b.ReportAllocs()

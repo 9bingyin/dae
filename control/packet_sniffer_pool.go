@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"net/netip"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/daeuniverse/dae/component/sniffing"
@@ -17,9 +16,8 @@ import (
 )
 
 const (
-	MaxQuicHeldDatagrams  = 16
-	MaxQuicHeldBytes      = 32 << 10
-	MaxActiveQuicSniffers = 1024
+	MaxQuicHeldDatagrams = 16
+	MaxQuicHeldBytes     = 32 << 10
 )
 
 type PacketSniffer struct {
@@ -34,10 +32,8 @@ type PacketSniffer struct {
 }
 
 type PacketSnifferPool struct {
-	pool      sync.Map
-	createMu  sync.Mutex
-	active    atomic.Int64
-	maxActive int64
+	pool     sync.Map
+	createMu sync.Mutex
 }
 
 type PacketSnifferOptions struct {
@@ -53,11 +49,7 @@ type PacketSnifferKey struct {
 var DefaultPacketSnifferSessionMgr = NewPacketSnifferPool()
 
 func NewPacketSnifferPool() *PacketSnifferPool {
-	return newPacketSnifferPool(MaxActiveQuicSniffers)
-}
-
-func newPacketSnifferPool(maxActive int64) *PacketSnifferPool {
-	return &PacketSnifferPool{maxActive: maxActive}
+	return &PacketSnifferPool{}
 }
 
 func (p *PacketSnifferPool) Remove(key PacketSnifferKey, sniffer *PacketSniffer) error {
@@ -74,7 +66,6 @@ func (p *PacketSnifferPool) removeLocked(key PacketSnifferKey, sniffer *PacketSn
 	if !p.pool.CompareAndDelete(key, sniffer) {
 		return false
 	}
-	p.active.Add(-1)
 	if sniffer.deadlineTimer != nil {
 		sniffer.deadlineTimer.Stop()
 		sniffer.deadlineTimer = nil
@@ -101,9 +92,6 @@ func (p *PacketSnifferPool) GetOrCreate(key PacketSnifferKey, options *PacketSni
 	if value, ok := p.pool.Load(key); ok {
 		return value.(*PacketSniffer), false
 	}
-	if p.maxActive > 0 && p.active.Load() >= p.maxActive {
-		return nil, false
-	}
 	if options == nil || options.Timeout <= 0 {
 		return nil, false
 	}
@@ -122,7 +110,6 @@ func (p *PacketSnifferPool) GetOrCreate(key PacketSnifferKey, options *PacketSni
 		}
 		putHeldPackets(p.expire(key, sniffer))
 	})
-	p.active.Add(1)
 	p.pool.Store(key, sniffer)
 	sniffer.Mu.Unlock()
 	return sniffer, true
