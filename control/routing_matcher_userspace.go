@@ -13,11 +13,11 @@ import (
 
 	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/component/routing"
-	"github.com/daeuniverse/dae/pkg/trie"
+	"github.com/daeuniverse/dae/component/routing/ipmatcher"
 )
 
 type RoutingMatcher struct {
-	lpmMatcher    []*trie.Trie
+	lpmMatcher    []*ipmatcher.PrefixSet
 	domainMatcher routing.DomainMatcher // All domain matchSets use one DomainMatcher.
 
 	matches []bpfMatchSet
@@ -40,32 +40,46 @@ func (m *RoutingMatcher) Match(
 		return 0, 0, false, fmt.Errorf("bad address length")
 	}
 
-	bin128s := make([]string, consts.MatchType_Mac+1)
-	bin128s[consts.MatchType_IpSet] = trie.Prefix2bin128(netip.PrefixFrom(netip.AddrFrom16(*(*[16]byte)(destAddr)), 128))
-	bin128s[consts.MatchType_SourceIpSet] = trie.Prefix2bin128(netip.PrefixFrom(netip.AddrFrom16(*(*[16]byte)(sourceAddr)), 128))
-	bin128s[consts.MatchType_Mac] = trie.Prefix2bin128(netip.PrefixFrom(netip.AddrFrom16(*(*[16]byte)(mac)), 128))
-
-	var domainMatchBitmap []uint32
-	if domain != "" {
-		domainMatchBitmap = m.domainMatcher.MatchDomainBitmap(domain)
-	}
+	var lpmAddrs [consts.MatchType_Mac + 1]netip.Addr
+	var lpmAddrPrepared [consts.MatchType_Mac + 1]bool
+	var preparedDomain routing.PreparedDomain
+	domainPrepared := false
 
 	goodSubrule := false
 	badRule := false
 	for i, match := range m.matches {
+		matchType := consts.MatchType(match.Type)
 		if badRule || goodSubrule {
 			goto beforeNextLoop
 		}
-		switch consts.MatchType(match.Type) {
+		switch matchType {
 		case consts.MatchType_IpSet, consts.MatchType_SourceIpSet, consts.MatchType_Mac:
-			lpmIndex := uint32(binary.LittleEndian.Uint16(match.Value[:]))
-			m := m.lpmMatcher[lpmIndex]
-			if m.HasPrefix(bin128s[match.Type]) {
-				goodSubrule = true
+			if !lpmAddrPrepared[matchType] {
+				switch matchType {
+				case consts.MatchType_IpSet:
+					lpmAddrs[matchType] = netip.AddrFrom16(*(*[16]byte)(destAddr))
+				case consts.MatchType_SourceIpSet:
+					lpmAddrs[matchType] = netip.AddrFrom16(*(*[16]byte)(sourceAddr))
+				case consts.MatchType_Mac:
+					lpmAddrs[matchType] = netip.AddrFrom16(*(*[16]byte)(mac))
+				}
+				lpmAddrPrepared[matchType] = true
+			}
+			lpmIndex := binary.LittleEndian.Uint16(match.Value[:])
+			if matchType == consts.MatchType_Mac {
+				goodSubrule = m.lpmMatcher[lpmIndex].ContainsRaw(lpmAddrs[matchType])
+			} else {
+				goodSubrule = m.lpmMatcher[lpmIndex].Contains(lpmAddrs[matchType])
 			}
 		case consts.MatchType_DomainSet:
-			if domainMatchBitmap != nil && (domainMatchBitmap[i/32]>>(i%32))&1 > 0 {
-				goodSubrule = true
+			if domain != "" {
+				if !domainPrepared {
+					preparedDomain = routing.PrepareDomain(domain)
+					domainPrepared = true
+				}
+				if m.domainMatcher.MatchPreparedDomain(&preparedDomain, i) {
+					goodSubrule = true
+				}
 			}
 		case consts.MatchType_Port:
 			portStart, portEnd := ParsePortRange(match.Value[:])

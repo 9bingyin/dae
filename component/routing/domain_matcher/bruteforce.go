@@ -38,41 +38,47 @@ func (n *Bruteforce) AddSet(bitIndex int, patterns []string, typ consts.RoutingD
 	}
 }
 func (n *Bruteforce) MatchDomainBitmap(domain string) (bitmap []uint32) {
+	prepared := routing.PrepareDomain(domain)
 	N := len(n.simulatedDomainSet) / 32
 	if len(n.simulatedDomainSet)%32 != 0 {
 		N++
 	}
-	domain = strings.ToLower(strings.TrimSuffix(domain, "."))
 	bitmap = make([]uint32, N)
-	for _, s := range n.simulatedDomainSet {
-		for _, d := range s.Domains {
-			var hit bool
-			switch s.Key {
-			case consts.RoutingDomainKey_Suffix:
-				if domain == d || strings.HasSuffix(domain, "."+strings.TrimPrefix(d, ".")) {
-					hit = true
-				}
-			case consts.RoutingDomainKey_Full:
-				if strings.EqualFold(domain, d) {
-					hit = true
-				}
-			case consts.RoutingDomainKey_Keyword:
-				if strings.Contains(strings.ToLower(domain), strings.ToLower(d)) {
-					hit = true
-				}
-			case consts.RoutingDomainKey_Regex:
-				if regexp.MustCompile(d).MatchString(strings.ToLower(domain)) {
-					hit = true
-				}
-			}
-			if hit {
-				//logrus.Traceln(d, s.Key, "matched given", domain)
-				bitmap[s.RuleIndex/32] |= 1 << (s.RuleIndex % 32)
-				break
-			}
+	for i, s := range n.simulatedDomainSet {
+		if n.MatchPreparedDomain(&prepared, i) {
+			bitmap[s.RuleIndex/32] |= 1 << (s.RuleIndex % 32)
 		}
 	}
 	return bitmap
+}
+
+func (n *Bruteforce) MatchPreparedDomain(domain *routing.PreparedDomain, bitIndex int) bool {
+	if bitIndex < 0 || bitIndex >= len(n.simulatedDomainSet) {
+		return false
+	}
+	s := n.simulatedDomainSet[bitIndex]
+	normalized := domain.Normalized()
+	for _, d := range s.Domains {
+		switch s.Key {
+		case consts.RoutingDomainKey_Suffix:
+			if normalized == d || strings.HasSuffix(normalized, "."+strings.TrimPrefix(d, ".")) {
+				return true
+			}
+		case consts.RoutingDomainKey_Full:
+			if strings.EqualFold(normalized, d) {
+				return true
+			}
+		case consts.RoutingDomainKey_Keyword:
+			if strings.Contains(normalized, strings.ToLower(d)) {
+				return true
+			}
+		case consts.RoutingDomainKey_Regex:
+			if regexp.MustCompile(d).MatchString(normalized) {
+				return true
+			}
+		}
+	}
+	return false
 }
 func (n *Bruteforce) Build() error {
 	if n.err != nil {

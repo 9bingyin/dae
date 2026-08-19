@@ -11,13 +11,12 @@ import (
 	"net/netip"
 	"strconv"
 
-	"github.com/daeuniverse/dae/pkg/trie"
-
 	"github.com/cilium/ebpf"
 	"github.com/daeuniverse/dae/common"
 	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/component/routing"
 	"github.com/daeuniverse/dae/component/routing/domain_matcher"
+	"github.com/daeuniverse/dae/component/routing/ipmatcher"
 	"github.com/daeuniverse/dae/config"
 	"github.com/daeuniverse/dae/pkg/config_parser"
 	"github.com/sirupsen/logrus"
@@ -362,14 +361,10 @@ func (b *RoutingMatcherBuilder) BuildUserspace() (matcher *RoutingMatcher, err e
 	for _, domains := range b.simulatedDomainSet {
 		domainMatcher.AddSet(domains.RuleIndex, domains.Domains, domains.Key)
 	}
-	// Build Ip matcher.
-	var lpmMatcher []*trie.Trie
+	// Build IP matchers.
+	lpmMatcher := make([]*ipmatcher.PrefixSet, 0, len(b.simulatedLpmTries))
 	for _, prefixes := range b.simulatedLpmTries {
-		t, err := trie.NewTrieFromPrefixes(prefixes)
-		if err != nil {
-			return nil, err
-		}
-		lpmMatcher = append(lpmMatcher, t)
+		lpmMatcher = append(lpmMatcher, ipmatcher.NewPrefixSet(prefixes))
 	}
 	if err = domainMatcher.Build(); err != nil {
 		return nil, err

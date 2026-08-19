@@ -21,6 +21,8 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
+var benchmarkMatched bool
+
 var TestSample = []string{
 	"9game.cn",
 	"aliapp.org",
@@ -205,6 +207,36 @@ func BenchmarkGoRegexpNfa(b *testing.B) {
 	runBenchmark(b, nfa)
 }
 
+func BenchmarkAhocorasickSlimtrieOrdered(b *testing.B) {
+	b.StopTimer()
+	logrus.SetLevel(logrus.WarnLevel)
+	simulatedDomainSet, err := getDomain()
+	if err != nil {
+		b.Fatal(err)
+	}
+	matcher := NewAhocorasickSlimtrie(logrus.StandardLogger(), consts.MaxMatchSetLen)
+	for _, domains := range simulatedDomainSet {
+		matcher.AddSet(domains.RuleIndex, domains.Domains, domains.Key)
+	}
+	if err = matcher.Build(); err != nil {
+		b.Fatal(err)
+	}
+	b.StartTimer()
+
+	rand.Seed(100)
+	matched := false
+	for i := 0; i < b.N; i++ {
+		prepared := routing.PrepareDomain(benchmarkDomainSample())
+		for _, domains := range simulatedDomainSet {
+			if matcher.MatchPreparedDomain(&prepared, domains.RuleIndex) {
+				matched = true
+				break
+			}
+		}
+	}
+	benchmarkMatched = matched
+}
+
 func BenchmarkAhocorasickSlimtrie(b *testing.B) {
 	b.StopTimer()
 	logrus.SetLevel(logrus.WarnLevel)
@@ -226,21 +258,24 @@ func BenchmarkAhocorasickSlimtrie(b *testing.B) {
 func runBenchmark(b *testing.B, matcher routing.DomainMatcher) {
 	rand.Seed(100)
 	for i := 0; i < b.N; i++ {
-		sample := TestSample[rand.Intn(len(TestSample))]
-		choice := rand.Intn(10)
-		switch {
-		case choice < 4:
-			addN := rand.Intn(5)
-			buf := make([]byte, addN)
-			for i := range buf {
-				buf[i] = 'a' + byte(rand.Intn('z'-'a'))
-			}
-			sample = string(buf) + "." + sample
-		case choice >= 4 && choice < 6:
-			k := rand.Intn(len(sample))
-			sample = sample[k:]
-		default:
+		matcher.MatchDomainBitmap(benchmarkDomainSample())
+	}
+}
+
+func benchmarkDomainSample() string {
+	sample := TestSample[rand.Intn(len(TestSample))]
+	choice := rand.Intn(10)
+	switch {
+	case choice < 4:
+		addN := rand.Intn(5)
+		buf := make([]byte, addN)
+		for i := range buf {
+			buf[i] = 'a' + byte(rand.Intn('z'-'a'))
 		}
-		matcher.MatchDomainBitmap(sample)
+		return string(buf) + "." + sample
+	case choice < 6:
+		return sample[rand.Intn(len(sample)):]
+	default:
+		return sample
 	}
 }

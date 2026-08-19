@@ -7,9 +7,11 @@ package domain_matcher
 
 import (
 	"fmt"
-	"github.com/daeuniverse/dae/common/consts"
 	"regexp"
 	"strings"
+
+	"github.com/daeuniverse/dae/common/consts"
+	"github.com/daeuniverse/dae/component/routing"
 )
 
 type GoRegexpNfa struct {
@@ -58,18 +60,22 @@ func (n *GoRegexpNfa) AddSet(bitIndex int, patterns []string, typ consts.Routing
 	}
 }
 func (n *GoRegexpNfa) MatchDomainBitmap(domain string) (bitmap []uint32) {
+	prepared := routing.PrepareDomain(domain)
 	N := len(n.nfa) / 32
 	if len(n.nfa)%32 != 0 {
 		N++
 	}
 	bitmap = make([]uint32, N)
-	domain = strings.ToLower(strings.TrimSuffix(domain, "."))
 	for _, i := range n.validIndexes {
-		if n.nfa[i].MatchString(domain) {
+		if n.MatchPreparedDomain(&prepared, i) {
 			bitmap[i/32] |= 1 << (i % 32)
 		}
 	}
 	return bitmap
+}
+
+func (n *GoRegexpNfa) MatchPreparedDomain(domain *routing.PreparedDomain, bitIndex int) bool {
+	return bitIndex >= 0 && bitIndex < len(n.nfa) && n.nfa[bitIndex] != nil && n.nfa[bitIndex].MatchString(domain.Normalized())
 }
 func (n *GoRegexpNfa) Build() error {
 	if n.err != nil {

@@ -13,9 +13,9 @@ import (
 	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/component/routing"
 	"github.com/daeuniverse/dae/component/routing/domain_matcher"
+	"github.com/daeuniverse/dae/component/routing/ipmatcher"
 	"github.com/daeuniverse/dae/config"
 	"github.com/daeuniverse/dae/pkg/config_parser"
-	"github.com/daeuniverse/dae/pkg/trie"
 	"github.com/sirupsen/logrus"
 )
 
@@ -23,7 +23,7 @@ type ResponseMatcherBuilder struct {
 	log                *logrus.Logger
 	upstreamName2Id    map[string]uint8
 	simulatedDomainSet []routing.DomainSet
-	ipSet              []*trie.Trie
+	ipSet              []*ipmatcher.PrefixSet
 	fallback           *routing.Outbound
 	rules              []responseMatchSet
 }
@@ -77,11 +77,7 @@ func (b *ResponseMatcherBuilder) addIp(f *config_parser.Function, cidrs []netip.
 		Not:      f.Not,
 		Upstream: uint8(upstreamId),
 	}
-	t, err := trie.NewTrieFromPrefixes(cidrs)
-	if err != nil {
-		return err
-	}
-	b.ipSet = append(b.ipSet, t)
+	b.ipSet = append(b.ipSet, ipmatcher.NewPrefixSet(cidrs))
 	b.rules = append(b.rules, rule)
 	return nil
 }
@@ -203,7 +199,7 @@ func (b *ResponseMatcherBuilder) Build() (matcher *ResponseMatcher, err error) {
 
 type ResponseMatcher struct {
 	domainMatcher routing.DomainMatcher // All domain matchSets use one DomainMatcher.
-	ipSet         []*trie.Trie
+	ipSet         []*ipmatcher.PrefixSet
 
 	matches []responseMatchSet
 }
@@ -224,11 +220,8 @@ func (m *ResponseMatcher) Match(
 	if qName == "" {
 		return 0, fmt.Errorf("qName cannot be empty")
 	}
-	domainMatchBitmap := m.domainMatcher.MatchDomainBitmap(qName)
-	bin128 := make([]string, 0, len(ips))
-	for _, ip := range ips {
-		bin128 = append(bin128, trie.Prefix2bin128(netip.PrefixFrom(netip.AddrFrom16(ip.As16()), 128)))
-	}
+	var preparedDomain routing.PreparedDomain
+	domainPrepared := false
 
 	goodSubrule := false
 	badRule := false
@@ -238,13 +231,17 @@ func (m *ResponseMatcher) Match(
 		}
 		switch match.Type {
 		case consts.MatchType_DomainSet:
-			if domainMatchBitmap != nil && (domainMatchBitmap[i/32]>>(i%32))&1 > 0 {
+			if !domainPrepared {
+				preparedDomain = routing.PrepareDomain(qName)
+				domainPrepared = true
+			}
+			if m.domainMatcher.MatchPreparedDomain(&preparedDomain, i) {
 				goodSubrule = true
 			}
 		case consts.MatchType_IpSet:
-			for _, bin128 := range bin128 {
-				// Check if any of IP hit the rule.
-				if m.ipSet[match.Value].HasPrefix(bin128) {
+			for _, ip := range ips {
+				// Check if any IP hits the rule.
+				if m.ipSet[match.Value].Contains(ip) {
 					goodSubrule = true
 					break
 				}

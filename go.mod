@@ -11,6 +11,7 @@ require (
 	github.com/daeuniverse/outbound v0.0.0-20250722064253-00c4fbb38759
 	github.com/daeuniverse/quic-go v0.0.0-20250210145620-2083199a7851
 	github.com/fsnotify/fsnotify v1.7.0
+	github.com/gaissmai/bart v0.29.0
 	github.com/json-iterator/go v1.1.12
 	github.com/mholt/archiver/v3 v3.5.1
 	github.com/miekg/dns v1.1.61

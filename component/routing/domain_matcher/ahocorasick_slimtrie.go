@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/daeuniverse/dae/common/consts"
+	"github.com/daeuniverse/dae/component/routing"
 	"github.com/daeuniverse/dae/pkg/trie"
 	"github.com/sirupsen/logrus"
 	"github.com/v2rayA/ahocorasick-domain"
@@ -93,56 +94,62 @@ nextPattern:
 	}
 }
 func (n *AhocorasickSlimtrie) MatchDomainBitmap(domain string) (bitmap []uint32) {
+	prepared := routing.PrepareDomain(domain)
 	N := len(n.ac) / 32
 	if len(n.ac)%32 != 0 {
 		N++
 	}
 	bitmap = make([]uint32, N)
-	domain = strings.ToLower(strings.TrimSuffix(domain, "."))
+
 	// Domain should consist of 'a'-'z' and '.' and '-'
 	// NOTE: DO NOT VERIFY THE DOMAIN TO MATCH: https://github.com/daeuniverse/dae/issues/528
-	// for _, b := range []byte(domain) {
+	// for _, b := range []byte(prepared.Normalized()) {
 	// 	if !ahocorasick.IsValidChar(b) {
 	// 		return bitmap
 	// 	}
 	// }
-	// Suffix matching.
-	suffixTrieDomain := ToSuffixTrieString("^" + domain)
 	for _, i := range n.validTrieIndexes {
-		if bitmap[i/32]&(1<<(i%32)) > 0 {
-			// Already matched.
-			continue
-		}
-		if n.trie[i].HasPrefix(suffixTrieDomain) {
+		if n.matchPreparedTrie(&prepared, i) {
 			bitmap[i/32] |= 1 << (i % 32)
 		}
 	}
-	// Keyword matching.
-	// Add magic chars as head and tail.
-	acDomain := "^" + domain + "$"
 	for _, i := range n.validAcIndexes {
-		if bitmap[i/32]&(1<<(i%32)) > 0 {
-			// Already matched.
-			continue
-		}
-		if n.ac[i].Contains([]byte(acDomain)) {
+		if bitmap[i/32]&(1<<(i%32)) == 0 && n.matchPreparedAC(&prepared, i) {
 			bitmap[i/32] |= 1 << (i % 32)
 		}
 	}
-	// Regex matching.
 	for _, i := range n.validRegexpIndexes {
-		if bitmap[i/32]&(1<<(i%32)) > 0 {
-			// Already matched.
-			continue
-		}
-		for _, r := range n.regexp[i] {
-			if r.MatchString(domain) {
-				bitmap[i/32] |= 1 << (i % 32)
-				break
-			}
+		if bitmap[i/32]&(1<<(i%32)) == 0 && n.matchPreparedRegexp(&prepared, i) {
+			bitmap[i/32] |= 1 << (i % 32)
 		}
 	}
 	return bitmap
+}
+
+func (n *AhocorasickSlimtrie) MatchPreparedDomain(domain *routing.PreparedDomain, bitIndex int) bool {
+	if bitIndex < 0 || bitIndex >= len(n.ac) {
+		return false
+	}
+	return n.matchPreparedTrie(domain, bitIndex) ||
+		n.matchPreparedAC(domain, bitIndex) ||
+		n.matchPreparedRegexp(domain, bitIndex)
+}
+
+func (n *AhocorasickSlimtrie) matchPreparedTrie(domain *routing.PreparedDomain, bitIndex int) bool {
+	return n.trie[bitIndex] != nil && n.trie[bitIndex].HasPrefix(domain.SuffixTrieKey())
+}
+
+func (n *AhocorasickSlimtrie) matchPreparedAC(domain *routing.PreparedDomain, bitIndex int) bool {
+	return n.ac[bitIndex] != nil && n.ac[bitIndex].Contains(domain.KeywordInput())
+}
+
+func (n *AhocorasickSlimtrie) matchPreparedRegexp(domain *routing.PreparedDomain, bitIndex int) bool {
+	for _, r := range n.regexp[bitIndex] {
+		if r.MatchString(domain.Normalized()) {
+			return true
+		}
+	}
+	return false
 }
 func ToSuffixTrieString(s string) string {
 	// No need for end char "$".
