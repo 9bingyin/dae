@@ -8,15 +8,26 @@ insert_lines() {
   local file="$1"
   if [ -f "$file" ]; then
     # Inserting lines at the beginning of the file
-    {
+    local tmp
+    tmp=$(mktemp "${file}.XXXXXX") || return 1
+    if {
       echo "/*"
-      echo "*  SPDX-License-Identifier: AGPL-3.0-only"
-      echo "*  Copyright (c) 2022-2025, daeuniverse Organization <dae@v2raya.org>"
-      echo "*/"
+      echo " * SPDX-License-Identifier: AGPL-3.0-only"
+      echo " * Copyright (c) 2026, 9bingyin"
+      echo " */"
       echo
       cat "$file"
-    } >tempfile && mv tempfile "$file"
-    echo "Lines inserted into $file"
+    } >"$tmp"; then
+      if chmod --reference="$file" "$tmp" && mv "$tmp" "$file"; then
+        echo "Lines inserted into $file"
+      else
+        rm -f "$tmp"
+        return 1
+      fi
+    else
+      rm -f "$tmp"
+      return 1
+    fi
   else
     echo "File not found: $file"
   fi

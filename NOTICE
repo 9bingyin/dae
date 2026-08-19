@@ -1,0 +1,24 @@
+dae
+
+This repository is derived from daeuniverse/dae.
+
+Upstream baseline:
+  https://github.com/daeuniverse/dae/commit/39831d5d24a129ce8c53258e54cfe6cde1502529
+
+Upstream code and contributions retain their existing copyright notices,
+including:
+
+  Copyright (c) 2022-2025, daeuniverse Organization <dae@v2raya.org>
+
+The fork starts with commit 1c012611ee1f158b8f0a2abb7f3dc6e710b3e287.
+Changes made in this fork are:
+
+  Copyright (c) 2026, 9bingyin
+
+Files inherited from upstream keep the upstream notice. Files modified by this
+fork also carry the fork notice where file-level notices are used. Files added
+by this fork carry the fork notice.
+
+The project is distributed under the GNU Affero General Public License,
+version 3 only. See LICENSE. Third-party files remain under their respective
+licenses and notices.
