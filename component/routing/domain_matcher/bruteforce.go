@@ -7,10 +7,11 @@ package domain_matcher
 
 import (
 	"fmt"
-	"github.com/daeuniverse/dae/common/consts"
-	"github.com/daeuniverse/dae/component/routing"
 	"regexp"
 	"strings"
+
+	"github.com/daeuniverse/dae/common/consts"
+	"github.com/daeuniverse/dae/component/routing"
 )
 
 type Bruteforce struct {
@@ -23,6 +24,7 @@ func NewBruteforce(bitLength int) *Bruteforce {
 		simulatedDomainSet: make([]routing.DomainSet, bitLength),
 	}
 }
+
 func (n *Bruteforce) AddSet(bitIndex int, patterns []string, typ consts.RoutingDomainKey) {
 	if n.err != nil {
 		return
@@ -37,16 +39,13 @@ func (n *Bruteforce) AddSet(bitIndex int, patterns []string, typ consts.RoutingD
 		Domains:   patterns,
 	}
 }
+
 func (n *Bruteforce) MatchDomainBitmap(domain string) (bitmap []uint32) {
 	prepared := routing.PrepareDomain(domain)
-	N := len(n.simulatedDomainSet) / 32
-	if len(n.simulatedDomainSet)%32 != 0 {
-		N++
-	}
-	bitmap = make([]uint32, N)
-	for i, s := range n.simulatedDomainSet {
-		if n.MatchPreparedDomain(&prepared, i) {
-			bitmap[s.RuleIndex/32] |= 1 << (s.RuleIndex % 32)
+	bitmap = make([]uint32, (len(n.simulatedDomainSet)+31)/32)
+	for bitIndex := range n.simulatedDomainSet {
+		if n.MatchPreparedDomain(&prepared, bitIndex) {
+			bitmap[bitIndex/32] |= 1 << (bitIndex % 32)
 		}
 	}
 	return bitmap
@@ -80,6 +79,7 @@ func (n *Bruteforce) MatchPreparedDomain(domain *routing.PreparedDomain, bitInde
 	}
 	return false
 }
+
 func (n *Bruteforce) Build() error {
 	if n.err != nil {
 		return n.err

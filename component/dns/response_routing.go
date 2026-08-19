@@ -23,7 +23,7 @@ type ResponseMatcherBuilder struct {
 	log                *logrus.Logger
 	upstreamName2Id    map[string]uint8
 	simulatedDomainSet []routing.DomainSet
-	ipSet              []*ipmatcher.PrefixSet
+	ipSets             []*ipmatcher.PrefixSet
 	fallback           *routing.Outbound
 	rules              []responseMatchSet
 }
@@ -72,12 +72,12 @@ func (b *ResponseMatcherBuilder) addIp(f *config_parser.Function, cidrs []netip.
 		return err
 	}
 	rule := responseMatchSet{
-		Value:    uint16(len(b.ipSet)),
+		Value:    uint16(len(b.ipSets)),
 		Type:     consts.MatchType_IpSet,
 		Not:      f.Not,
 		Upstream: uint8(upstreamId),
 	}
-	b.ipSet = append(b.ipSet, ipmatcher.NewPrefixSet(cidrs))
+	b.ipSets = append(b.ipSets, ipmatcher.NewPrefixSet(cidrs))
 	b.rules = append(b.rules, rule)
 	return nil
 }
@@ -185,7 +185,7 @@ func (b *ResponseMatcherBuilder) Build() (matcher *ResponseMatcher, err error) {
 		return nil, err
 	}
 	// IpSet.
-	m.ipSet = b.ipSet
+	m.ipSets = b.ipSets
 
 	// Write routings.
 	// Fallback rule MUST be the last.
@@ -199,7 +199,7 @@ func (b *ResponseMatcherBuilder) Build() (matcher *ResponseMatcher, err error) {
 
 type ResponseMatcher struct {
 	domainMatcher routing.DomainMatcher // All domain matchSets use one DomainMatcher.
-	ipSet         []*ipmatcher.PrefixSet
+	ipSets        []*ipmatcher.PrefixSet
 
 	matches []responseMatchSet
 }
@@ -235,13 +235,11 @@ func (m *ResponseMatcher) Match(
 				preparedDomain = routing.PrepareDomain(qName)
 				domainPrepared = true
 			}
-			if m.domainMatcher.MatchPreparedDomain(&preparedDomain, i) {
-				goodSubrule = true
-			}
+			goodSubrule = m.domainMatcher.MatchPreparedDomain(&preparedDomain, i)
 		case consts.MatchType_IpSet:
 			for _, ip := range ips {
 				// Check if any IP hits the rule.
-				if m.ipSet[match.Value].Contains(ip) {
+				if m.ipSets[match.Value].Contains(ip) {
 					goodSubrule = true
 					break
 				}

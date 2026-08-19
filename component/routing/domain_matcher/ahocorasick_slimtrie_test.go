@@ -6,7 +6,7 @@
 package domain_matcher
 
 import (
-	"math/rand"
+	"math/rand/v2"
 	"testing"
 
 	"github.com/daeuniverse/dae/common/consts"
@@ -64,23 +64,9 @@ func TestAhocorasickSlimtrie(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rand.Seed(200)
+	rng := rand.New(rand.NewPCG(200, 0))
 	for i := 0; i < 10000; i++ {
-		sample := TestSample[rand.Intn(len(TestSample))]
-		choice := rand.Intn(10)
-		switch {
-		case choice < 4:
-			addN := rand.Intn(5)
-			buf := make([]byte, addN)
-			for i := range buf {
-				buf[i] = 'a' + byte(rand.Intn('z'-'a'))
-			}
-			sample = string(buf) + "." + sample
-		case choice >= 4 && choice < 6:
-			k := rand.Intn(len(sample))
-			sample = sample[k:]
-		default:
-		}
+		sample := randomDomainSample(rng)
 		bitmap := bf.MatchDomainBitmap(sample)
 		bitmap2 := actrie.MatchDomainBitmap(sample)
 		if !slices.Equal(bitmap, bitmap2) {

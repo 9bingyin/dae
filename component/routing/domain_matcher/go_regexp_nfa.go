@@ -27,6 +27,7 @@ func NewGoRegexpNfa(bitLength int) *GoRegexpNfa {
 		toBuild: make([][]string, bitLength),
 	}
 }
+
 func (n *GoRegexpNfa) AddSet(bitIndex int, patterns []string, typ consts.RoutingDomainKey) {
 	if n.err != nil {
 		return
@@ -59,13 +60,10 @@ func (n *GoRegexpNfa) AddSet(bitIndex int, patterns []string, typ consts.Routing
 		return
 	}
 }
+
 func (n *GoRegexpNfa) MatchDomainBitmap(domain string) (bitmap []uint32) {
 	prepared := routing.PrepareDomain(domain)
-	N := len(n.nfa) / 32
-	if len(n.nfa)%32 != 0 {
-		N++
-	}
-	bitmap = make([]uint32, N)
+	bitmap = make([]uint32, (len(n.nfa)+31)/32)
 	for _, i := range n.validIndexes {
 		if n.MatchPreparedDomain(&prepared, i) {
 			bitmap[i/32] |= 1 << (i % 32)
@@ -77,6 +75,7 @@ func (n *GoRegexpNfa) MatchDomainBitmap(domain string) (bitmap []uint32) {
 func (n *GoRegexpNfa) MatchPreparedDomain(domain *routing.PreparedDomain, bitIndex int) bool {
 	return bitIndex >= 0 && bitIndex < len(n.nfa) && n.nfa[bitIndex] != nil && n.nfa[bitIndex].MatchString(domain.Normalized())
 }
+
 func (n *GoRegexpNfa) Build() error {
 	if n.err != nil {
 		return n.err

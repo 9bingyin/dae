@@ -183,9 +183,7 @@ func (m *RequestMatcher) Match(
 					preparedDomain = routing.PrepareDomain(qName)
 					domainPrepared = true
 				}
-				if m.domainMatcher.MatchPreparedDomain(&preparedDomain, i) {
-					goodSubrule = true
-				}
+				goodSubrule = m.domainMatcher.MatchPreparedDomain(&preparedDomain, i)
 			}
 		case consts.MatchType_QType:
 			if qType == match.Value {

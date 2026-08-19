@@ -82,13 +82,13 @@ func TestResponseMatcherMatchesDomainsInRuleOrder(t *testing.T) {
 	}
 }
 
-func TestResponseMatcherBARTIPSets(t *testing.T) {
+func TestResponseMatcherIPSets(t *testing.T) {
 	ipSet := ipmatcher.NewPrefixSet([]netip.Prefix{
 		netip.MustParsePrefix("10.0.0.0/8"),
 		netip.MustParsePrefix("2001:db8::/32"),
 	})
 	matcher := &ResponseMatcher{
-		ipSet: []*ipmatcher.PrefixSet{ipSet},
+		ipSets: []*ipmatcher.PrefixSet{ipSet},
 		matches: []responseMatchSet{
 			{Type: consts.MatchType_IpSet, Value: 0, Upstream: 1},
 			{Type: consts.MatchType_Fallback, Upstream: 2},

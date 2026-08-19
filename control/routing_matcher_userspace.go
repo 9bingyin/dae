@@ -17,7 +17,7 @@ import (
 )
 
 type RoutingMatcher struct {
-	lpmMatcher    []*ipmatcher.PrefixSet
+	prefixSets    []*ipmatcher.PrefixSet
 	domainMatcher routing.DomainMatcher // All domain matchSets use one DomainMatcher.
 
 	matches []bpfMatchSet
@@ -40,8 +40,7 @@ func (m *RoutingMatcher) Match(
 		return 0, 0, false, fmt.Errorf("bad address length")
 	}
 
-	var lpmAddrs [consts.MatchType_Mac + 1]netip.Addr
-	var lpmAddrPrepared [consts.MatchType_Mac + 1]bool
+	var sourceIP, destIP, macAddr netip.Addr
 	var preparedDomain routing.PreparedDomain
 	domainPrepared := false
 
@@ -54,22 +53,29 @@ func (m *RoutingMatcher) Match(
 		}
 		switch matchType {
 		case consts.MatchType_IpSet, consts.MatchType_SourceIpSet, consts.MatchType_Mac:
-			if !lpmAddrPrepared[matchType] {
-				switch matchType {
-				case consts.MatchType_IpSet:
-					lpmAddrs[matchType] = netip.AddrFrom16(*(*[16]byte)(destAddr))
-				case consts.MatchType_SourceIpSet:
-					lpmAddrs[matchType] = netip.AddrFrom16(*(*[16]byte)(sourceAddr))
-				case consts.MatchType_Mac:
-					lpmAddrs[matchType] = netip.AddrFrom16(*(*[16]byte)(mac))
+			var addr netip.Addr
+			switch matchType {
+			case consts.MatchType_IpSet:
+				if !destIP.IsValid() {
+					destIP = netip.AddrFrom16(*(*[16]byte)(destAddr))
 				}
-				lpmAddrPrepared[matchType] = true
+				addr = destIP
+			case consts.MatchType_SourceIpSet:
+				if !sourceIP.IsValid() {
+					sourceIP = netip.AddrFrom16(*(*[16]byte)(sourceAddr))
+				}
+				addr = sourceIP
+			case consts.MatchType_Mac:
+				if !macAddr.IsValid() {
+					macAddr = netip.AddrFrom16(*(*[16]byte)(mac))
+				}
+				addr = macAddr
 			}
-			lpmIndex := binary.LittleEndian.Uint16(match.Value[:])
+			prefixSet := m.prefixSets[binary.LittleEndian.Uint16(match.Value[:])]
 			if matchType == consts.MatchType_Mac {
-				goodSubrule = m.lpmMatcher[lpmIndex].ContainsRaw(lpmAddrs[matchType])
+				goodSubrule = prefixSet.ContainsRaw(addr)
 			} else {
-				goodSubrule = m.lpmMatcher[lpmIndex].Contains(lpmAddrs[matchType])
+				goodSubrule = prefixSet.Contains(addr)
 			}
 		case consts.MatchType_DomainSet:
 			if domain != "" {
@@ -77,9 +83,7 @@ func (m *RoutingMatcher) Match(
 					preparedDomain = routing.PrepareDomain(domain)
 					domainPrepared = true
 				}
-				if m.domainMatcher.MatchPreparedDomain(&preparedDomain, i) {
-					goodSubrule = true
-				}
+				goodSubrule = m.domainMatcher.MatchPreparedDomain(&preparedDomain, i)
 			}
 		case consts.MatchType_Port:
 			portStart, portEnd := ParsePortRange(match.Value[:])

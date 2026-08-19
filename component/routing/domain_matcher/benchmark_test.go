@@ -8,12 +8,11 @@ package domain_matcher
 import (
 	"fmt"
 	"hash/fnv"
-	"math/rand"
+	"math/rand/v2"
 	"reflect"
 	"testing"
 
 	"github.com/daeuniverse/dae/common/assets"
-
 	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/component/routing"
 	"github.com/daeuniverse/dae/config"
@@ -209,25 +208,14 @@ func BenchmarkGoRegexpNfa(b *testing.B) {
 
 func BenchmarkAhocorasickSlimtrieOrdered(b *testing.B) {
 	b.StopTimer()
-	logrus.SetLevel(logrus.WarnLevel)
-	simulatedDomainSet, err := getDomain()
-	if err != nil {
-		b.Fatal(err)
-	}
-	matcher := NewAhocorasickSlimtrie(logrus.StandardLogger(), consts.MaxMatchSetLen)
-	for _, domains := range simulatedDomainSet {
-		matcher.AddSet(domains.RuleIndex, domains.Domains, domains.Key)
-	}
-	if err = matcher.Build(); err != nil {
-		b.Fatal(err)
-	}
+	matcher, domainSets := buildAhocorasickSlimtrieBenchmark(b)
 	b.StartTimer()
 
-	rand.Seed(100)
+	rng := rand.New(rand.NewPCG(100, 0))
 	matched := false
 	for i := 0; i < b.N; i++ {
-		prepared := routing.PrepareDomain(benchmarkDomainSample())
-		for _, domains := range simulatedDomainSet {
+		prepared := routing.PrepareDomain(randomDomainSample(rng))
+		for _, domains := range domainSets {
 			if matcher.MatchPreparedDomain(&prepared, domains.RuleIndex) {
 				matched = true
 				break
@@ -239,42 +227,48 @@ func BenchmarkAhocorasickSlimtrieOrdered(b *testing.B) {
 
 func BenchmarkAhocorasickSlimtrie(b *testing.B) {
 	b.StopTimer()
+	matcher, _ := buildAhocorasickSlimtrieBenchmark(b)
+	b.StartTimer()
+	runBenchmark(b, matcher)
+}
+
+func buildAhocorasickSlimtrieBenchmark(b *testing.B) (*AhocorasickSlimtrie, []routing.DomainSet) {
+	b.Helper()
 	logrus.SetLevel(logrus.WarnLevel)
-	simulatedDomainSet, err := getDomain()
+	domainSets, err := getDomain()
 	if err != nil {
 		b.Fatal(err)
 	}
-	ahocorasick := NewAhocorasickSlimtrie(logrus.StandardLogger(), consts.MaxMatchSetLen)
-	for _, domains := range simulatedDomainSet {
-		ahocorasick.AddSet(domains.RuleIndex, domains.Domains, domains.Key)
+	matcher := NewAhocorasickSlimtrie(logrus.StandardLogger(), consts.MaxMatchSetLen)
+	for _, domains := range domainSets {
+		matcher.AddSet(domains.RuleIndex, domains.Domains, domains.Key)
 	}
-	if err = ahocorasick.Build(); err != nil {
+	if err := matcher.Build(); err != nil {
 		b.Fatal(err)
 	}
-	b.StartTimer()
-	runBenchmark(b, ahocorasick)
+	return matcher, domainSets
 }
 
 func runBenchmark(b *testing.B, matcher routing.DomainMatcher) {
-	rand.Seed(100)
+	rng := rand.New(rand.NewPCG(100, 0))
 	for i := 0; i < b.N; i++ {
-		matcher.MatchDomainBitmap(benchmarkDomainSample())
+		matcher.MatchDomainBitmap(randomDomainSample(rng))
 	}
 }
 
-func benchmarkDomainSample() string {
-	sample := TestSample[rand.Intn(len(TestSample))]
-	choice := rand.Intn(10)
+func randomDomainSample(rng *rand.Rand) string {
+	sample := TestSample[rng.IntN(len(TestSample))]
+	choice := rng.IntN(10)
 	switch {
 	case choice < 4:
-		addN := rand.Intn(5)
+		addN := rng.IntN(5)
 		buf := make([]byte, addN)
 		for i := range buf {
-			buf[i] = 'a' + byte(rand.Intn('z'-'a'))
+			buf[i] = 'a' + byte(rng.IntN('z'-'a'))
 		}
 		return string(buf) + "." + sample
 	case choice < 6:
-		return sample[rand.Intn(len(sample)):]
+		return sample[rng.IntN(len(sample)):]
 	default:
 		return sample
 	}

@@ -362,9 +362,9 @@ func (b *RoutingMatcherBuilder) BuildUserspace() (matcher *RoutingMatcher, err e
 		domainMatcher.AddSet(domains.RuleIndex, domains.Domains, domains.Key)
 	}
 	// Build IP matchers.
-	lpmMatcher := make([]*ipmatcher.PrefixSet, 0, len(b.simulatedLpmTries))
+	prefixSets := make([]*ipmatcher.PrefixSet, 0, len(b.simulatedLpmTries))
 	for _, prefixes := range b.simulatedLpmTries {
-		lpmMatcher = append(lpmMatcher, ipmatcher.NewPrefixSet(prefixes))
+		prefixSets = append(prefixSets, ipmatcher.NewPrefixSet(prefixes))
 	}
 	if err = domainMatcher.Build(); err != nil {
 		return nil, err
@@ -377,7 +377,7 @@ func (b *RoutingMatcherBuilder) BuildUserspace() (matcher *RoutingMatcher, err e
 	}
 
 	return &RoutingMatcher{
-		lpmMatcher:    lpmMatcher,
+		prefixSets:    prefixSets,
 		domainMatcher: domainMatcher,
 		matches:       b.rules,
 	}, nil

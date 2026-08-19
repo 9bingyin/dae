@@ -44,6 +44,7 @@ func NewAhocorasickSlimtrie(log *logrus.Logger, bitLength int) *AhocorasickSlimt
 		toBuildTrie: make([][]string, bitLength),
 	}
 }
+
 func (n *AhocorasickSlimtrie) AddSet(bitIndex int, patterns []string, typ consts.RoutingDomainKey) {
 	if n.err != nil {
 		return
@@ -93,13 +94,10 @@ nextPattern:
 		}
 	}
 }
+
 func (n *AhocorasickSlimtrie) MatchDomainBitmap(domain string) (bitmap []uint32) {
 	prepared := routing.PrepareDomain(domain)
-	N := len(n.ac) / 32
-	if len(n.ac)%32 != 0 {
-		N++
-	}
-	bitmap = make([]uint32, N)
+	bitmap = make([]uint32, (len(n.ac)+31)/32)
 
 	// Domain should consist of 'a'-'z' and '.' and '-'
 	// NOTE: DO NOT VERIFY THE DOMAIN TO MATCH: https://github.com/daeuniverse/dae/issues/528
@@ -151,6 +149,7 @@ func (n *AhocorasickSlimtrie) matchPreparedRegexp(domain *routing.PreparedDomain
 	}
 	return false
 }
+
 func ToSuffixTrieString(s string) string {
 	// No need for end char "$".
 	b := []byte(strings.TrimSuffix(s, "$"))
@@ -161,6 +160,7 @@ func ToSuffixTrieString(s string) string {
 	}
 	return string(b)
 }
+
 func ToSuffixTrieStrings(s []string) []string {
 	to := make([]string, len(s))
 	for i := range s {
@@ -168,6 +168,7 @@ func ToSuffixTrieStrings(s []string) []string {
 	}
 	return to
 }
+
 func (n *AhocorasickSlimtrie) Build() (err error) {
 	if n.err != nil {
 		return n.err

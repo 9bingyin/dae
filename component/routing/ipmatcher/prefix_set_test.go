@@ -87,14 +87,15 @@ func TestPrefixSetMatchesLegacyIPTrie(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	rng := rand.New(rand.NewPCG(1, 0))
 	for range 10000 {
 		var addr netip.Addr
-		if rand.Uint32()&1 == 0 {
-			addr = netip.AddrFrom4([4]byte{byte(rand.Uint32()), byte(rand.Uint32()), byte(rand.Uint32()), byte(rand.Uint32())})
+		if rng.Uint32()&1 == 0 {
+			addr = netip.AddrFrom4([4]byte{byte(rng.Uint32()), byte(rng.Uint32()), byte(rng.Uint32()), byte(rng.Uint32())})
 		} else {
 			var raw [16]byte
 			for i := range raw {
-				raw[i] = byte(rand.Uint32())
+				raw[i] = byte(rng.Uint32())
 			}
 			addr = netip.AddrFrom16(raw)
 		}

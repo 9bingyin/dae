@@ -79,7 +79,7 @@ func TestRoutingMatcherMatchesDomainsInRuleOrder(t *testing.T) {
 	}
 }
 
-func TestRoutingMatcherBARTIPSets(t *testing.T) {
+func TestRoutingMatcherIPSets(t *testing.T) {
 	ipSet := ipmatcher.NewPrefixSet([]netip.Prefix{
 		netip.MustParsePrefix("10.0.0.0/8"),
 		netip.MustParsePrefix("2001:db8::/32"),
@@ -88,7 +88,7 @@ func TestRoutingMatcherBARTIPSets(t *testing.T) {
 	ipRule := bpfMatchSet{Type: uint8(consts.MatchType_IpSet), Outbound: 1}
 	binary.LittleEndian.PutUint16(ipRule.Value[:], 0)
 	matcher := &RoutingMatcher{
-		lpmMatcher: []*ipmatcher.PrefixSet{ipSet},
+		prefixSets: []*ipmatcher.PrefixSet{ipSet},
 		matches: []bpfMatchSet{
 			ipRule,
 			{Type: uint8(consts.MatchType_Fallback), Outbound: 2},
@@ -117,7 +117,7 @@ func TestRoutingMatcherBARTIPSets(t *testing.T) {
 	}
 }
 
-func TestRoutingMatcherBARTPreservesMappedMAC(t *testing.T) {
+func TestRoutingMatcherPreservesMappedMAC(t *testing.T) {
 	mac := [16]byte{10: 0xff, 11: 0xff, 12: 1, 13: 2, 14: 3, 15: 4}
 	macSet := ipmatcher.NewPrefixSet([]netip.Prefix{
 		netip.PrefixFrom(netip.AddrFrom16(mac), 128),
@@ -126,7 +126,7 @@ func TestRoutingMatcherBARTPreservesMappedMAC(t *testing.T) {
 	macRule := bpfMatchSet{Type: uint8(consts.MatchType_Mac), Outbound: 1}
 	binary.LittleEndian.PutUint16(macRule.Value[:], 0)
 	matcher := &RoutingMatcher{
-		lpmMatcher: []*ipmatcher.PrefixSet{macSet},
+		prefixSets: []*ipmatcher.PrefixSet{macSet},
 		matches: []bpfMatchSet{
 			macRule,
 			{Type: uint8(consts.MatchType_Fallback), Outbound: 2},

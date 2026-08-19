@@ -11,13 +11,14 @@ import (
 	"github.com/gaissmai/bart"
 )
 
-var mappedIPv4Base = [16]byte{10: 0xff, 11: 0xff}
+var mappedIPv4Prefix = netip.MustParsePrefix("::ffff:0.0.0.0/96")
 
 // PrefixSet is a read-optimized userspace IP prefix set backed by BART.
 type PrefixSet struct {
 	table bart.Lite
 }
 
+// NewPrefixSet builds a prefix set and preserves the legacy mapped IPv4 namespace.
 func NewPrefixSet(prefixes []netip.Prefix) *PrefixSet {
 	set := new(PrefixSet)
 	for _, prefix := range prefixes {
@@ -43,32 +44,13 @@ func (s *PrefixSet) ContainsRaw(addr netip.Addr) bool {
 }
 
 func projectMappedIPv4Prefix(prefix netip.Prefix) (netip.Prefix, bool) {
-	if !prefix.IsValid() || prefix.Addr().Is4() {
+	if !prefix.IsValid() || prefix.Addr().Is4() || !prefix.Overlaps(mappedIPv4Prefix) {
 		return netip.Prefix{}, false
 	}
+	if prefix.Bits() <= mappedIPv4Prefix.Bits() {
+		return netip.PrefixFrom(netip.IPv4Unspecified(), 0), true
+	}
 
-	bits := prefix.Bits()
-	compareBits := min(bits, 96)
 	addr := prefix.Addr().As16()
-	if !equalLeadingBits(addr, mappedIPv4Base, compareBits) {
-		return netip.Prefix{}, false
-	}
-	if bits <= 96 {
-		return netip.PrefixFrom(netip.AddrFrom4([4]byte{}), 0), true
-	}
-	return netip.PrefixFrom(netip.AddrFrom4([4]byte(addr[12:])), bits-96), true
-}
-
-func equalLeadingBits(a, b [16]byte, n int) bool {
-	fullBytes := n / 8
-	for i := 0; i < fullBytes; i++ {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	if remaining := n % 8; remaining != 0 {
-		mask := byte(0xff << (8 - remaining))
-		return a[fullBytes]&mask == b[fullBytes]&mask
-	}
-	return true
+	return netip.PrefixFrom(netip.AddrFrom4([4]byte(addr[12:])), prefix.Bits()-mappedIPv4Prefix.Bits()), true
 }
