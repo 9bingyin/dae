@@ -18,14 +18,14 @@ import (
 )
 
 const (
-	QuicFlagLongPacketType = 4
-	QuicFlagHeaderForm     = 7
+	quicFlagLongPacketType = 4
+	quicFlagHeaderForm     = 7
 
-	QuicFlagHeaderFormLongHeader = 1
+	quicFlagHeaderFormLongHeader = 1
 
-	MaxQuicCryptoBytes = 16 << 10
-	MaxQuicFragments   = 64
-	MaxQuicCIDLength   = 20
+	maxQuicCryptoBytes = 16 << 10
+	maxQuicFragments   = 64
+	maxQuicCIDLength   = 20
 )
 
 type QuicSniffState uint8
@@ -65,15 +65,13 @@ func (s QuicSniffState) String() string {
 }
 
 type QuicSniffResult struct {
-	State   QuicSniffState
-	Domain  string
-	Version uint32
-	Err     error
+	State  QuicSniffState
+	Domain string
+	Err    error
 }
 
 type QuicSniffer struct {
 	versionNumber uint32
-	version       quicutils.Version
 	originalDCID  []byte
 	keys          *quicutils.Keys
 	reassembler   *quicutils.CryptoReassembler
@@ -83,7 +81,7 @@ type QuicSniffer struct {
 
 func NewQuicSniffer() *QuicSniffer {
 	return &QuicSniffer{
-		reassembler: quicutils.NewCryptoReassembler(MaxQuicCryptoBytes, MaxQuicFragments),
+		reassembler: quicutils.NewCryptoReassembler(maxQuicCryptoBytes, maxQuicFragments),
 	}
 }
 
@@ -97,7 +95,10 @@ func (s *QuicSniffer) Close() error {
 		}
 		s.keys = nil
 	}
+	s.versionNumber = 0
 	s.originalDCID = nil
+	s.largestPN = 0
+	s.hasLargestPN = false
 	s.reassembler.Reset()
 	return nil
 }
@@ -125,7 +126,7 @@ func (s *QuicSniffer) Feed(datagram []byte) QuicSniffResult {
 
 		packet := datagram[offset : offset+header.packetEnd]
 		if err := s.ensureKeys(header); err != nil {
-			return QuicSniffResult{State: QuicSniffMalformed, Version: header.versionNumber, Err: err}
+			return QuicSniffResult{State: QuicSniffMalformed, Err: err}
 		}
 
 		plaintext, packetNumber, err := s.keys.DecryptInitial(packet, header.packetNumberOffset, header.packetEnd, s.largestPN, s.hasLargestPN)
@@ -133,7 +134,7 @@ func (s *QuicSniffer) Feed(datagram []byte) QuicSniffResult {
 			plaintext, packetNumber, err = s.retryDecrypt(packet, header)
 		}
 		if err != nil {
-			return QuicSniffResult{State: QuicSniffMalformed, Version: header.versionNumber, Err: err}
+			return QuicSniffResult{State: QuicSniffMalformed, Err: err}
 		}
 		if !s.hasLargestPN || packetNumber > s.largestPN {
 			s.largestPN = packetNumber
@@ -143,19 +144,19 @@ func (s *QuicSniffer) Feed(datagram []byte) QuicSniffResult {
 		frames, err := quicutils.ExtractCryptoFrames(plaintext)
 		if err != nil {
 			if errors.Is(err, quicutils.ErrConnectionClose) {
-				return QuicSniffResult{State: QuicSniffNoSNI, Version: header.versionNumber, Err: err}
+				return QuicSniffResult{State: QuicSniffNoSNI, Err: err}
 			}
-			return QuicSniffResult{State: QuicSniffMalformed, Version: header.versionNumber, Err: err}
+			return QuicSniffResult{State: QuicSniffMalformed, Err: err}
 		}
 		for _, frame := range frames {
 			if err := s.reassembler.Add(frame.Offset, frame.Data); err != nil {
 				switch {
 				case errors.Is(err, quicutils.ErrAmbiguousCrypto):
-					return QuicSniffResult{State: QuicSniffAmbiguousOverlap, Version: header.versionNumber, Err: err}
+					return QuicSniffResult{State: QuicSniffAmbiguousOverlap, Err: err}
 				case errors.Is(err, quicutils.ErrCryptoLimit):
-					return QuicSniffResult{State: QuicSniffResourceLimit, Version: header.versionNumber, Err: err}
+					return QuicSniffResult{State: QuicSniffResourceLimit, Err: err}
 				default:
-					return QuicSniffResult{State: QuicSniffMalformed, Version: header.versionNumber, Err: err}
+					return QuicSniffResult{State: QuicSniffMalformed, Err: err}
 				}
 			}
 		}
@@ -183,7 +184,6 @@ func (s *QuicSniffer) ensureKeys(header initialHeader) error {
 		return fmt.Errorf("derive quic initial keys: %w", err)
 	}
 	s.keys = keys
-	s.version = header.version
 	s.versionNumber = header.versionNumber
 	s.originalDCID = slices.Clone(header.dcid)
 	return nil
@@ -210,7 +210,7 @@ func (s *QuicSniffer) retryDecrypt(packet []byte, header initialHeader) ([]byte,
 }
 
 func (s *QuicSniffer) clientHelloResult() QuicSniffResult {
-	result := QuicSniffResult{State: QuicSniffNeedMore, Version: s.versionNumber}
+	result := QuicSniffResult{State: QuicSniffNeedMore}
 	clientHello := s.reassembler.ContiguousBytes()
 	if len(clientHello) < 4 {
 		return result
@@ -223,7 +223,7 @@ func (s *QuicSniffer) clientHelloResult() QuicSniffResult {
 
 	handshakeLength := int(clientHello[1])<<16 | int(clientHello[2])<<8 | int(clientHello[3])
 	expectedLength := 4 + handshakeLength
-	if expectedLength > MaxQuicCryptoBytes {
+	if expectedLength > maxQuicCryptoBytes {
 		result.State = QuicSniffResourceLimit
 		result.Err = quicutils.ErrCryptoLimit
 		return result
@@ -272,7 +272,7 @@ func parseInitialHeader(packet []byte) (initialHeader, error) {
 		return initialHeader{}, errNotInitial
 	}
 	firstByte := packet[0]
-	if firstByte>>QuicFlagHeaderForm&0b1 != QuicFlagHeaderFormLongHeader {
+	if firstByte>>quicFlagHeaderForm&0b1 != quicFlagHeaderFormLongHeader {
 		return initialHeader{}, errNotInitial
 	}
 
@@ -281,13 +281,13 @@ func parseInitialHeader(packet []byte) (initialHeader, error) {
 	if err != nil {
 		return initialHeader{}, fmt.Errorf("%w: %v", errUnsupportedVersion, err)
 	}
-	if firstByte>>QuicFlagLongPacketType&0b11 != version.InitialPacketType() {
+	if firstByte>>quicFlagLongPacketType&0b11 != version.InitialPacketType() {
 		return initialHeader{}, errNotInitial
 	}
 
 	offset := destinationConnectionIDPosition
 	dcidLength := int(packet[offset-1])
-	if dcidLength > MaxQuicCIDLength || dcidLength > len(packet)-offset {
+	if dcidLength > maxQuicCIDLength || dcidLength > len(packet)-offset {
 		return initialHeader{}, io.ErrUnexpectedEOF
 	}
 	dcid := packet[offset : offset+dcidLength]
@@ -298,7 +298,7 @@ func parseInitialHeader(packet []byte) (initialHeader, error) {
 
 	scidLength := int(packet[offset])
 	offset++
-	if scidLength > MaxQuicCIDLength || scidLength > len(packet)-offset {
+	if scidLength > maxQuicCIDLength || scidLength > len(packet)-offset {
 		return initialHeader{}, io.ErrUnexpectedEOF
 	}
 	offset += scidLength

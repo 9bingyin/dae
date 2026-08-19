@@ -10,10 +10,21 @@ import "testing"
 func FuzzQuicSnifferFeed(f *testing.F) {
 	f.Add([]byte{})
 	f.Add([]byte{0xc0, 0, 0, 0, 1})
-	f.Add(QuicStream3)
+	f.Add(quicStream)
 	f.Fuzz(func(t *testing.T, datagram []byte) {
 		sniffer := NewQuicSniffer()
-		_ = sniffer.Feed(datagram)
-		_ = sniffer.Close()
+		result := sniffer.Feed(datagram)
+		if result.State == QuicSniffFound && result.Domain == "" {
+			t.Fatal("found result has an empty domain")
+		}
+		if result.State == QuicSniffNeedMore && result.Err != nil {
+			t.Fatalf("need-more result has an error: %v", result.Err)
+		}
+		if err := sniffer.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := sniffer.Close(); err != nil {
+			t.Fatal(err)
+		}
 	})
 }

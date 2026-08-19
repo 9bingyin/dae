@@ -16,6 +16,10 @@ import (
 )
 
 func TestQuicSnifferVersions(t *testing.T) {
+	if testing.Short() {
+		t.Skip("requires a local UDP integration test")
+	}
+
 	tests := []struct {
 		name    string
 		version quic.Version

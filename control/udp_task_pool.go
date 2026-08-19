@@ -59,12 +59,12 @@ func NewUdpTaskPool() *UdpTaskPool {
 
 // EmitTask makes sure packets with the same key are sent in order.
 func (p *UdpTaskPool) EmitTask(key string, task UdpTask) {
-	_ = p.TryEmitTask(key, task)
+	_ = p.tryEmitTask(key, task)
 }
 
-// TryEmitTask reports whether task was accepted by the queue. Callers that
+// tryEmitTask reports whether task was accepted by the queue. Callers that
 // transfer ownership to a task can release it when the queue is already closed.
-func (p *UdpTaskPool) TryEmitTask(key string, task UdpTask) bool {
+func (p *UdpTaskPool) tryEmitTask(key string, task UdpTask) bool {
 	p.mu.Lock()
 	q, ok := p.m[key]
 	if !ok {

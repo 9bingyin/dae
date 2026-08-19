@@ -110,24 +110,48 @@ func TestCryptoReassemblerLimits(t *testing.T) {
 	}
 }
 
-func TestExtractCryptoFramesWithAck(t *testing.T) {
-	payload := []byte{
-		FrameTypeAck,
-		0, // Largest Acknowledged
-		0, // ACK Delay
-		0, // ACK Range Count
-		0, // First ACK Range
-		FrameTypeCrypto,
-		0, // Offset
-		3, // Length
-		'a', 'b', 'c',
+func TestExtractCryptoFrames(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload []byte
+		wantErr error
+	}{
+		{
+			name: "ack and crypto",
+			payload: []byte{
+				FrameTypePadding,
+				FrameTypePing,
+				FrameTypeAck,
+				0, 0, 0, 0, // Largest, delay, range count, first range.
+				FrameTypeCrypto,
+				0, 3, 'a', 'b', 'c', // Offset, length, data.
+			},
+		},
+		{
+			name: "ack ecn and crypto",
+			payload: []byte{
+				FrameTypeAckECN,
+				0, 0, 0, 0, // ACK fields.
+				0, 0, 0, // ECT(0), ECT(1), CE counts.
+				FrameTypeCrypto,
+				0, 3, 'a', 'b', 'c',
+			},
+		},
+		{name: "transport close", payload: []byte{FrameTypeConnectionClose, 0, 0, 0}, wantErr: ErrConnectionClose},
+		{name: "application close", payload: []byte{FrameTypeApplicationClose, 0, 0}, wantErr: ErrConnectionClose},
+		{name: "unknown frame", payload: []byte{0x04}, wantErr: ErrUnknownFrameType},
 	}
-	frames, err := ExtractCryptoFrames(payload)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(frames) != 1 || frames[0].Offset != 0 || string(frames[0].Data) != "abc" {
-		t.Fatalf("frames = %+v", frames)
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			frames, err := ExtractCryptoFrames(test.payload)
+			if !errors.Is(err, test.wantErr) {
+				t.Fatalf("error = %v, want %v", err, test.wantErr)
+			}
+			if test.wantErr == nil && (len(frames) != 1 || frames[0].Offset != 0 || string(frames[0].Data) != "abc") {
+				t.Fatalf("frames = %+v", frames)
+			}
+		})
 	}
 }
 

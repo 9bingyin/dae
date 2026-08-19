@@ -63,7 +63,7 @@ func sendPkt(log *logrus.Logger, data []byte, from netip.AddrPort, realTo, to ne
 
 func (c *ControlPlane) quicTimeoutHandler(key PacketSnifferKey, lConn *net.UDPConn, src, pktDst, realDst netip.AddrPort, routingResult bpfRoutingResult) func(*PacketSniffer) {
 	return func(sniffer *PacketSniffer) {
-		accepted := DefaultUdpTaskPool.TryEmitTask(src.String(), func() {
+		accepted := DefaultUdpTaskPool.tryEmitTask(src.String(), func() {
 			packets := DefaultPacketSnifferSessionMgr.expire(key, sniffer)
 			if len(packets) == 0 {
 				return
@@ -170,7 +170,7 @@ func (c *ControlPlane) handlePkt(lConn *net.UDPConn, data []byte, src, pktDst, r
 						}
 					}
 
-					heldPackets := sniffer.TakeHeldLocked()
+					heldPackets := sniffer.takeHeldLocked()
 					removed := DefaultPacketSnifferSessionMgr.removeLocked(key, sniffer)
 					closeErr := sniffer.closeLocked()
 					sniffer.Mu.Unlock()

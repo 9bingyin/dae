@@ -14,9 +14,10 @@ import (
 )
 
 var (
-	ErrAmbiguousCrypto = errors.New("conflicting crypto data")
-	ErrCryptoLimit     = errors.New("crypto reassembly limit exceeded")
-	ErrConnectionClose = errors.New("quic connection closed")
+	ErrAmbiguousCrypto  = errors.New("conflicting crypto data")
+	ErrCryptoLimit      = errors.New("crypto reassembly limit exceeded")
+	ErrConnectionClose  = errors.New("quic connection closed")
+	ErrUnknownFrameType = errors.New("unknown frame type")
 )
 
 const (
@@ -173,7 +174,6 @@ type CryptoReassembler struct {
 	maxBytes     int
 	maxFragments int
 	fragments    int
-	totalBytes   int
 }
 
 func NewCryptoReassembler(maxBytes, maxFragments int) *CryptoReassembler {
@@ -181,12 +181,8 @@ func NewCryptoReassembler(maxBytes, maxFragments int) *CryptoReassembler {
 }
 
 func (r *CryptoReassembler) Reset() {
-	for i := range r.segments {
-		r.segments[i].data = nil
-	}
 	r.segments = nil
 	r.fragments = 0
-	r.totalBytes = 0
 }
 
 func (r *CryptoReassembler) Add(offset uint64, data []byte) error {
@@ -199,6 +195,11 @@ func (r *CryptoReassembler) Add(offset uint64, data []byte) error {
 	}
 	if offset > uint64(r.maxBytes) || uint64(len(data)) > uint64(r.maxBytes)-offset {
 		return ErrCryptoLimit
+	}
+	for _, segment := range r.segments {
+		if segment.offset == offset && bytes.Equal(segment.data, data) {
+			return nil
+		}
 	}
 
 	merged := cryptoSegment{offset: offset, data: slices.Clone(data)}
@@ -237,7 +238,6 @@ func (r *CryptoReassembler) Add(offset uint64, data []byte) error {
 		return ErrCryptoLimit
 	}
 	r.segments = out
-	r.totalBytes = total
 	return nil
 }
 
@@ -246,10 +246,6 @@ func (r *CryptoReassembler) ContiguousBytes() []byte {
 		return nil
 	}
 	return r.segments[0].data
-}
-
-func (r *CryptoReassembler) TotalBytes() int {
-	return r.totalBytes
 }
 
 func segmentEnd(segment cryptoSegment) uint64 {

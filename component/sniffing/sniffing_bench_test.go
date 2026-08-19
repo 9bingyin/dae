@@ -6,7 +6,6 @@
 package sniffing
 
 import (
-	"fmt"
 	"testing"
 
 	"github.com/daeuniverse/dae/common"
@@ -15,7 +14,8 @@ import (
 )
 
 var (
-	httpMethodSet map[string]struct{}
+	httpMethodSet     map[string]struct{}
+	httpMethodMatches int
 )
 
 func init() {
@@ -27,22 +27,25 @@ func init() {
 }
 
 func BenchmarkStringSet(b *testing.B) {
-	for i := 0; i < b.N; i++ {
+	matches := 0
+	for b.Loop() {
 		var test [5]byte
 		fastrand.Read(test[:])
-		_, ok := httpMethodSet[string(test[:])]
-		if !ok {
-			_ = fmt.Sprintf("%v", string(test[:]))
+		if _, ok := httpMethodSet[string(test[:])]; ok {
+			matches++
 		}
 	}
+	httpMethodMatches = matches
 }
 
 func BenchmarkStringSwitch(b *testing.B) {
-	for i := 0; i < b.N; i++ {
+	matches := 0
+	for b.Loop() {
 		var test [5]byte
 		fastrand.Read(test[:])
-		if !common.IsValidHttpMethod(string(test[:])) {
-			_ = fmt.Sprintf("%v", string(test[:]))
+		if common.IsValidHttpMethod(string(test[:])) {
+			matches++
 		}
 	}
+	httpMethodMatches = matches
 }

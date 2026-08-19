@@ -23,7 +23,6 @@ func TestDeriveKeys(t *testing.T) {
 	}
 	defer keys.Close()
 
-	t.Logf("%#v", keys)
 	clientInitialSecret, _ := hex.DecodeString("c00cf151ca5be075ed0ebfb5c80323c42d6b7db67881289af4008f1f6c357aea")
 	if !bytes.Equal(keys.clientInitialSecret, clientInitialSecret) {
 		t.Fatal("key")
@@ -115,5 +114,7 @@ func TestKeys_PayloadDecrypt_(t *testing.T) {
 	if err != nil {
 		t.Fatal("PayloadDecryptFromPool:", err)
 	}
-	t.Log(hex.EncodeToString(plaintext))
+	if len(plaintext) == 0 || plaintext[0] != FrameTypeCrypto {
+		t.Fatalf("plaintext does not start with a CRYPTO frame: %x", plaintext)
+	}
 }

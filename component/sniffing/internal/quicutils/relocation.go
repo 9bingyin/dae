@@ -10,17 +10,13 @@ import (
 	"fmt"
 )
 
-var (
-	ErrUnknownFrameType = errors.New("unknown frame type")
-	ErrOutOfRange       = errors.New("index out of range")
-)
+var ErrOutOfRange = errors.New("index out of range")
 
 type Locator interface {
 	Range(i, j int) ([]byte, error)
 	Slice(i, j int) (Locator, error)
 	At(i int) (byte, error)
 	Len() int
-	Bytes() ([]byte, error)
 }
 
 type BuiltinBytesLocator []byte
@@ -48,10 +44,6 @@ func (l BuiltinBytesLocator) Slice(i, j int) (Locator, error) {
 
 func (l BuiltinBytesLocator) Len() int {
 	return len(l)
-}
-
-func (l BuiltinBytesLocator) Bytes() ([]byte, error) {
-	return l, nil
 }
 
 var _ Locator = BuiltinBytesLocator{}

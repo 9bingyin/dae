@@ -25,7 +25,7 @@ const (
 	maxPacketNumber       = uint64(1)<<62 - 1
 )
 
-var InitialClientLabel = []byte("client in")
+var initialClientLabel = []byte("client in")
 
 type Keys struct {
 	version             Version
@@ -55,7 +55,7 @@ func NewKeys(clientDstConnectionID []byte, version Version, newAead func(key []b
 	// RFC 9001 Section 5.2 derives Initial secrets from the Destination
 	// Connection ID in the client's first Initial packet.
 	initialSecret := hkdf.Extract(sha256.New, clientDstConnectionID, version.InitialSalt())
-	clientInitialSecret, err := HkdfExpandLabelFromPool(sha256.New, initialSecret, InitialClientLabel, nil, 32)
+	clientInitialSecret, err := HkdfExpandLabelFromPool(sha256.New, initialSecret, initialClientLabel, nil, 32)
 	if err != nil {
 		return nil, fmt.Errorf("expand client initial secret: %w", err)
 	}

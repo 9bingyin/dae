@@ -62,10 +62,20 @@ func TestQuicSnifferResetsKeysAfterRetry(t *testing.T) {
 }
 
 func testClientHello(domain string) []byte {
+	return testClientHelloWithPadding(domain, 0)
+}
+
+func testClientHelloWithPadding(domain string, padding int) []byte {
 	serverName := []byte(domain)
 	serverNameListLength := 1 + 2 + len(serverName)
 	serverNameExtensionLength := 2 + serverNameListLength
-	extensionsLength := 4 + serverNameExtensionLength
+	extensionsLength := 0
+	if domain != "" {
+		extensionsLength = 4 + serverNameExtensionLength
+	}
+	if padding > 0 {
+		extensionsLength += 4 + padding
+	}
 	bodyLength := 2 + 32 + 1 + 2 + 2 + 1 + 1 + 2 + extensionsLength
 
 	hello := make([]byte, 4+bodyLength)
@@ -87,18 +97,25 @@ func testClientHello(domain string) []byte {
 	offset += 2
 	binary.BigEndian.PutUint16(hello[offset:], uint16(extensionsLength))
 	offset += 2
-	binary.BigEndian.PutUint16(hello[offset:], TlsExtension_ServerName)
-	binary.BigEndian.PutUint16(hello[offset+2:], uint16(serverNameExtensionLength))
-	offset += 4
-	binary.BigEndian.PutUint16(hello[offset:], uint16(serverNameListLength))
-	offset += 2
-	hello[offset] = TlsExtension_ServerNameType_HostName
-	binary.BigEndian.PutUint16(hello[offset+1:], uint16(len(serverName)))
-	copy(hello[offset+3:], serverName)
+	if domain != "" {
+		binary.BigEndian.PutUint16(hello[offset:], TlsExtension_ServerName)
+		binary.BigEndian.PutUint16(hello[offset+2:], uint16(serverNameExtensionLength))
+		offset += 4
+		binary.BigEndian.PutUint16(hello[offset:], uint16(serverNameListLength))
+		offset += 2
+		hello[offset] = TlsExtension_ServerNameType_HostName
+		binary.BigEndian.PutUint16(hello[offset+1:], uint16(len(serverName)))
+		copy(hello[offset+3:], serverName)
+		offset += 3 + len(serverName)
+	}
+	if padding > 0 {
+		binary.BigEndian.PutUint16(hello[offset:], 21) // padding extension
+		binary.BigEndian.PutUint16(hello[offset+2:], uint16(padding))
+	}
 	return hello
 }
 
-func buildTestInitial(t *testing.T, version quicutils.Version, headerDCID, keyDCID, token []byte, packetNumber byte, cryptoOffset uint64, cryptoData []byte) []byte {
+func buildTestInitial(t testing.TB, version quicutils.Version, headerDCID, keyDCID, token []byte, packetNumber byte, cryptoOffset uint64, cryptoData []byte) []byte {
 	t.Helper()
 	wireVersion := quicutils.VersionNumberV1
 	if version == quicutils.Version_V2 {
@@ -148,10 +165,10 @@ func buildTestInitial(t *testing.T, version quicutils.Version, headerDCID, keyDC
 	return packet
 }
 
-func testInitialKeys(t *testing.T, version quicutils.Version, dcid []byte) (key, iv, hp []byte) {
+func testInitialKeys(t testing.TB, version quicutils.Version, dcid []byte) (key, iv, hp []byte) {
 	t.Helper()
 	initialSecret := hkdf.Extract(sha256.New, dcid, version.InitialSalt())
-	clientSecret, err := quicutils.HkdfExpandLabelFromPool(sha256.New, initialSecret, quicutils.InitialClientLabel, nil, 32)
+	clientSecret, err := quicutils.HkdfExpandLabelFromPool(sha256.New, initialSecret, []byte("client in"), nil, 32)
 	if err != nil {
 		t.Fatal(err)
 	}

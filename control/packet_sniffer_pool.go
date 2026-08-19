@@ -16,8 +16,8 @@ import (
 )
 
 const (
-	MaxQuicHeldDatagrams = 16
-	MaxQuicHeldBytes     = 32 << 10
+	maxQuicHeldDatagrams = 16
+	maxQuicHeldBytes     = 32 << 10
 )
 
 type PacketSniffer struct {
@@ -32,8 +32,7 @@ type PacketSniffer struct {
 }
 
 type PacketSnifferPool struct {
-	pool     sync.Map
-	createMu sync.Mutex
+	pool sync.Map
 }
 
 type PacketSnifferOptions struct {
@@ -85,13 +84,6 @@ func (p *PacketSnifferPool) GetOrCreate(key PacketSnifferKey, options *PacketSni
 	if value, ok := p.pool.Load(key); ok {
 		return value.(*PacketSniffer), false
 	}
-
-	p.createMu.Lock()
-	defer p.createMu.Unlock()
-
-	if value, ok := p.pool.Load(key); ok {
-		return value.(*PacketSniffer), false
-	}
 	if options == nil || options.Timeout <= 0 {
 		return nil, false
 	}
@@ -100,9 +92,14 @@ func (p *PacketSnifferPool) GetOrCreate(key PacketSnifferKey, options *PacketSni
 		Sniffer:   sniffing.NewQuicSniffer(),
 		onTimeout: options.OnTimeout,
 	}
-	// Publish the session while holding its mutex so consumers cannot finish it
-	// before the expiry timer has been installed.
+	// Block consumers until the winning session has installed its timer.
 	sniffer.Mu.Lock()
+	value, loaded := p.pool.LoadOrStore(key, sniffer)
+	if loaded {
+		_ = sniffer.closeLocked()
+		sniffer.Mu.Unlock()
+		return value.(*PacketSniffer), false
+	}
 	sniffer.deadlineTimer = time.AfterFunc(options.Timeout, func() {
 		if sniffer.onTimeout != nil {
 			sniffer.onTimeout(sniffer)
@@ -110,7 +107,6 @@ func (p *PacketSnifferPool) GetOrCreate(key PacketSnifferKey, options *PacketSni
 		}
 		putHeldPackets(p.expire(key, sniffer))
 	})
-	p.pool.Store(key, sniffer)
 	sniffer.Mu.Unlock()
 	return sniffer, true
 }
@@ -130,7 +126,7 @@ func (s *PacketSniffer) HoldLocked(data []byte) error {
 	if s.closed {
 		return fmt.Errorf("packet sniffer is closed")
 	}
-	if len(s.heldPackets) >= MaxQuicHeldDatagrams || len(data) > MaxQuicHeldBytes-s.heldBytes {
+	if len(s.heldPackets) >= maxQuicHeldDatagrams || len(data) > maxQuicHeldBytes-s.heldBytes {
 		return fmt.Errorf("quic held packet limit exceeded")
 	}
 	packet := pool.Get(len(data))
@@ -138,10 +134,6 @@ func (s *PacketSniffer) HoldLocked(data []byte) error {
 	s.heldPackets = append(s.heldPackets, packet)
 	s.heldBytes += len(packet)
 	return nil
-}
-
-func (s *PacketSniffer) TakeHeldLocked() []pool.PB {
-	return s.takeHeldLocked()
 }
 
 func (s *PacketSniffer) takeHeldLocked() []pool.PB {
