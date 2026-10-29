@@ -8,6 +8,7 @@ package control
 
 import (
 	"math"
+	"sort"
 	"sync"
 	"time"
 )
@@ -17,6 +18,7 @@ const (
 	defaultRuntimeWindowSec  = 30 * 60
 	defaultRuntimeMaxPoints  = 180
 	runtimeBucketDuration    = 250 * time.Millisecond
+	maxRuntimeHistoryBuckets = maxRuntimeHistorySeconds * int(time.Second/runtimeBucketDuration)
 	runtimeRateWindow        = time.Second
 )
 
@@ -54,6 +56,7 @@ type runtimeStats struct {
 	uploadTotal   uint64
 	downloadTotal uint64
 	history       []runtimeBucket
+	historyHead   int
 }
 
 var globalRuntimeStats = &runtimeStats{}
@@ -95,19 +98,17 @@ func (s *runtimeStats) snapshot(activeConnections int, udpSessions int, windowSe
 		maxPoints = defaultRuntimeMaxPoints
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	nowBucketStart := bucketStart(now)
-	s.advanceLocked(nowBucketStart)
-
 	startTime := now.Add(-time.Duration(windowSec) * time.Second)
 
-	buckets := make([]runtimeBucket, 0, len(s.history)+1)
-	for _, bucket := range s.history {
-		if !bucket.Timestamp.Before(startTime) {
-			buckets = append(buckets, bucket)
-		}
+	s.mu.Lock()
+	s.advanceLocked(bucketStart(now))
+
+	start := sort.Search(len(s.history), func(i int) bool {
+		return !s.history[(s.historyHead+i)%len(s.history)].Timestamp.Before(startTime)
+	})
+	buckets := make([]runtimeBucket, 0, len(s.history)-start+1)
+	for i := start; i < len(s.history); i++ {
+		buckets = append(buckets, s.history[(s.historyHead+i)%len(s.history)])
 	}
 
 	currentDuration := now.Sub(s.currentBucketStart)
@@ -120,6 +121,8 @@ func (s *runtimeStats) snapshot(activeConnections int, udpSessions int, windowSe
 		DownloadBytes: s.currentDownloadBytes,
 		Duration:      currentDuration,
 	})
+	uploadTotal, downloadTotal := s.uploadTotal, s.downloadTotal
+	s.mu.Unlock()
 
 	uploadRate, downloadRate := ratesFromBuckets(buckets, now, runtimeRateWindow)
 
@@ -127,8 +130,8 @@ func (s *runtimeStats) snapshot(activeConnections int, udpSessions int, windowSe
 		UpdatedAt:         now,
 		UploadRate:        uploadRate,
 		DownloadRate:      downloadRate,
-		UploadTotal:       s.uploadTotal,
-		DownloadTotal:     s.downloadTotal,
+		UploadTotal:       uploadTotal,
+		DownloadTotal:     downloadTotal,
 		ActiveConnections: activeConnections,
 		UDPSessions:       udpSessions,
 		Samples:           bucketizeRuntimeSamples(samplesFromBuckets(buckets), maxPoints),
@@ -144,18 +147,31 @@ func (s *runtimeStats) advanceLocked(targetBucketStart time.Time) {
 		return
 	}
 
+	if s.history == nil {
+		s.history = make([]runtimeBucket, 0, maxRuntimeHistoryBuckets)
+	}
+	if targetBucketStart.Sub(s.currentBucketStart) > time.Duration(maxRuntimeHistorySeconds)*time.Second {
+		// Older buckets cannot appear in the retained history.
+		s.history = s.history[:0]
+		s.historyHead = 0
+		s.currentBucketStart = targetBucketStart.Add(-time.Duration(maxRuntimeHistorySeconds) * time.Second)
+		s.currentUploadBytes = 0
+		s.currentDownloadBytes = 0
+	}
 	for s.currentBucketStart.Before(targetBucketStart) {
-		s.history = append(s.history, runtimeBucket{
+		bucket := runtimeBucket{
 			Timestamp:     s.currentBucketStart.Add(runtimeBucketDuration),
 			UploadBytes:   s.currentUploadBytes,
 			DownloadBytes: s.currentDownloadBytes,
 			Duration:      runtimeBucketDuration,
-		})
-		maxHistoryBuckets := int((time.Duration(maxRuntimeHistorySeconds) * time.Second) / runtimeBucketDuration)
-		if len(s.history) > maxHistoryBuckets {
-			s.history = append([]runtimeBucket(nil), s.history[len(s.history)-maxHistoryBuckets:]...)
 		}
-		s.currentBucketStart = s.currentBucketStart.Add(runtimeBucketDuration)
+		if len(s.history) < maxRuntimeHistoryBuckets {
+			s.history = append(s.history, bucket)
+		} else {
+			s.history[s.historyHead] = bucket
+			s.historyHead = (s.historyHead + 1) % len(s.history)
+		}
+		s.currentBucketStart = bucket.Timestamp
 		s.currentUploadBytes = 0
 		s.currentDownloadBytes = 0
 	}

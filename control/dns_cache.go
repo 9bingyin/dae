@@ -8,6 +8,7 @@ package control
 
 import (
 	"net/netip"
+	"slices"
 	"time"
 
 	dnsmessage "github.com/miekg/dns"
@@ -23,12 +24,34 @@ type DnsCache struct {
 	OriginalDeadline time.Time // This field is not impacted by `fixed_domain_ttl`.
 }
 
-func (c *DnsCache) FillInto(req *dnsmessage.Msg) {
-	if c.Answer != nil {
-		req.Answer = deepcopy.Copy(c.Answer).([]dnsmessage.RR)
-	} else {
-		req.Answer = nil
+func copyDnsAnswers(answers []dnsmessage.RR) []dnsmessage.RR {
+	if answers == nil {
+		return nil
 	}
+	copied := make([]dnsmessage.RR, len(answers))
+	for i, answer := range answers {
+		switch answer := answer.(type) {
+		case nil:
+		case *dnsmessage.A:
+			cloned := *answer
+			cloned.A = slices.Clone(answer.A)
+			copied[i] = &cloned
+		case *dnsmessage.AAAA:
+			cloned := *answer
+			cloned.AAAA = slices.Clone(answer.AAAA)
+			copied[i] = &cloned
+		case *dnsmessage.CNAME, *dnsmessage.NS, *dnsmessage.MX, *dnsmessage.SOA, *dnsmessage.PTR, *dnsmessage.DNAME:
+			copied[i] = dnsmessage.Copy(answer)
+		default:
+			// Preserve nested slice shapes and isolation for uncommon records.
+			copied[i] = deepcopy.Copy(answer).(dnsmessage.RR)
+		}
+	}
+	return copied
+}
+
+func (c *DnsCache) FillInto(req *dnsmessage.Msg) {
+	req.Answer = copyDnsAnswers(c.Answer)
 	req.Rcode = c.Rcode
 	req.Response = true
 	req.RecursionAvailable = true

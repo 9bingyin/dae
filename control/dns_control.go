@@ -9,6 +9,7 @@ package control
 import (
 	"context"
 	"fmt"
+	"maps"
 	"math"
 	"net"
 	"net/netip"
@@ -191,8 +192,13 @@ func (c *DnsController) cloneDnsCache() map[string]*DnsCache {
 	}()
 
 	c.dnsCacheMu.Lock()
-	defer c.dnsCacheMu.Unlock()
-	return deepcopy.Copy(c.dnsCache).(map[string]*DnsCache)
+	cloned := maps.Clone(c.dnsCache)
+	c.dnsCacheMu.Unlock()
+	// All key shards remain locked, keeping the snapshot stable while copying.
+	for key, cache := range cloned {
+		cloned[key] = cloneDnsCache(cache)
+	}
+	return cloned
 }
 
 func splitDnsCacheKey(cacheKey string) (fqdn string, ok bool) {
@@ -232,7 +238,7 @@ func (c *DnsController) ImportDnsCache(caches map[string]*DnsCache) ([]*DnsCache
 }
 
 func (c *DnsController) importDnsCache(cacheKey string, fqdn string, cache *DnsCache) (*DnsCache, error) {
-	newCache, err := c.newCache(fqdn, slices.Clone(cache.Answer), cache.Deadline, cache.OriginalDeadline)
+	newCache, err := c.newCache(fqdn, copyDnsAnswers(cache.Answer), cache.Deadline, cache.OriginalDeadline)
 	if err != nil {
 		return nil, err
 	}
@@ -244,8 +250,9 @@ func (c *DnsController) importDnsCache(cacheKey string, fqdn string, cache *DnsC
 	defer keyLock.Unlock()
 
 	c.dnsCacheMu.Lock()
-	oldCache := cloneDnsCache(c.dnsCache[cacheKey])
+	oldCache := c.dnsCache[cacheKey]
 	c.dnsCacheMu.Unlock()
+	oldCache = cloneDnsCache(oldCache)
 
 	if err = c.cacheUpdateCallback(oldCache, cloneDnsCache(newCache)); err != nil {
 		return nil, err
@@ -264,13 +271,12 @@ func (c *DnsController) RemoveDnsRespCache(cacheKey string) {
 
 	c.dnsCacheMu.Lock()
 	cache, ok := c.dnsCache[cacheKey]
-	removed := cloneDnsCache(cache)
 	c.dnsCacheMu.Unlock()
 	if !ok {
 		return
 	}
 
-	if err := c.cacheRemoveCallback(removed); err != nil {
+	if err := c.cacheRemoveCallback(cloneDnsCache(cache)); err != nil {
 		c.log.Warnf("failed to remove DNS cache mapping: %v", err)
 		return
 	}
@@ -288,9 +294,7 @@ func cloneDnsCache(cache *DnsCache) *DnsCache {
 	}
 	cloned := *cache
 	cloned.DomainBitmap = slices.Clone(cache.DomainBitmap)
-	if cache.Answer != nil {
-		cloned.Answer = deepcopy.Copy(cache.Answer).([]dnsmessage.RR)
-	}
+	cloned.Answer = copyDnsAnswers(cache.Answer)
 	return &cloned
 }
 
@@ -301,8 +305,8 @@ func (c *DnsController) LookupDnsRespCache(cacheKey string, ignoreFixedTtl bool)
 
 	c.dnsCacheMu.Lock()
 	cache, ok := c.dnsCache[cacheKey]
+	c.dnsCacheMu.Unlock()
 	if !ok {
-		c.dnsCacheMu.Unlock()
 		return nil
 	}
 	var deadline time.Time
@@ -315,7 +319,6 @@ func (c *DnsController) LookupDnsRespCache(cacheKey string, ignoreFixedTtl bool)
 	// per-key lock prevents a late removal from overtaking a refresh.
 	if !deadline.After(time.Now()) {
 		removed := cloneDnsCache(cache)
-		c.dnsCacheMu.Unlock()
 		if err := c.cacheRemoveCallback(removed); err != nil {
 			c.log.Warnf("failed to remove expired DNS cache mapping: %v", err)
 			return nil
@@ -329,7 +332,6 @@ func (c *DnsController) LookupDnsRespCache(cacheKey string, ignoreFixedTtl bool)
 	}
 	// Return a snapshot so concurrent updates cannot race with readers.
 	cloned := cloneDnsCache(cache)
-	c.dnsCacheMu.Unlock()
 	if err := c.cacheAccessCallback(cloned); err != nil {
 		c.log.Warnf("failed to access DNS cache: %v", err)
 		return nil
@@ -479,10 +481,7 @@ func (c *DnsController) __updateDnsCacheDeadline(host string, dnsTyp uint16, ans
 
 	cacheKey := c.cacheKey(fqdn, dnsTyp)
 	// Copy-on-write: never mutate a published cache entry in place.
-	answerCopy := answers
-	if answers != nil {
-		answerCopy = deepcopy.Copy(answers).([]dnsmessage.RR)
-	}
+	answerCopy := copyDnsAnswers(answers)
 	newCache, err := c.newCache(fqdn, answerCopy, deadline, originalDeadline)
 	if err != nil {
 		return err
@@ -495,8 +494,9 @@ func (c *DnsController) __updateDnsCacheDeadline(host string, dnsTyp uint16, ans
 	defer keyLock.Unlock()
 
 	c.dnsCacheMu.Lock()
-	oldCache := cloneDnsCache(c.dnsCache[cacheKey])
+	oldCache := c.dnsCache[cacheKey]
 	c.dnsCacheMu.Unlock()
+	oldCache = cloneDnsCache(oldCache)
 
 	// Commit the domain mapping before publishing the DNS answer. Lookups for
 	// this key wait on keyLock and cannot observe a partially committed entry.
