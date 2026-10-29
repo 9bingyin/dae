@@ -1,6 +1,7 @@
 /*
  * SPDX-License-Identifier: AGPL-3.0-only
  * Copyright (c) 2022-2025, daeuniverse Organization <dae@v2raya.org>
+ * Copyright (c) 2026, 9bingyin
  */
 
 package sniffing
@@ -27,6 +28,13 @@ func NewConnSniffer(conn net.Conn, timeout time.Duration) *ConnSniffer {
 
 func (s *ConnSniffer) Read(p []byte) (n int, err error) {
 	return s.Sniffer.Read(p)
+}
+
+func (s *ConnSniffer) CloseWrite() error {
+	if conn, ok := s.Conn.(interface{ CloseWrite() error }); ok {
+		return conn.CloseWrite()
+	}
+	return nil
 }
 
 func (s *ConnSniffer) Close() (err error) {
