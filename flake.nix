@@ -2,53 +2,50 @@
   description = "dae development shell";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    flake-utils.url = "github:numtide/flake-utils";
-    treefmt-nix.url = "github:numtide/treefmt-nix";
+    nixpkgs.url = "https://channels.nixos.org/nixos-unstable/nixexprs.tar.zst";
+    flake-parts = {
+      url = "github:hercules-ci/flake-parts";
+      inputs.nixpkgs-lib.follows = "nixpkgs";
+    };
+    treefmt-nix = {
+      url = "github:numtide/treefmt-nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs =
-    {
-      self,
-      nixpkgs,
-      flake-utils,
-      treefmt-nix,
-    }:
-    flake-utils.lib.eachDefaultSystem (
-      system:
-      let
-        pkgs = nixpkgs.legacyPackages.${system};
-        clangVersion = builtins.getEnv "CLANG_VERSION";
-        llvmPackages =
-          if clangVersion == "" then
-            pkgs.llvmPackages_19
-          else
-            pkgs."llvmPackages_${clangVersion}" or pkgs.llvmPackages_19;
-        treefmtEval = treefmt-nix.lib.evalModule pkgs {
-          projectRootFile = "flake.nix";
-          programs = {
+    inputs:
+    inputs.flake-parts.lib.mkFlake { inherit inputs; } {
+      imports = [ inputs.treefmt-nix.flakeModule ];
+      systems = [
+        "x86_64-linux"
+        "aarch64-linux"
+      ];
+
+      perSystem =
+        { pkgs, ... }:
+        let
+          llvmPackages = pkgs."llvmPackages_${builtins.getEnv "CLANG_VERSION"}" or pkgs.llvmPackages;
+        in
+        {
+          treefmt.programs = {
             nixfmt.enable = true;
             gofmt.enable = true;
             shfmt.enable = true;
           };
-        };
-      in
-      {
-        formatter = treefmtEval.config.build.wrapper;
-        devShells.default = pkgs.mkShell {
-          packages = [
-            pkgs.go_1_26
-            llvmPackages.clang-unwrapped
-            llvmPackages.llvm
-            pkgs.gnumake
-            pkgs.nodejs
-          ];
 
-          shellHook = ''
-            export CLANG=clang
-            export STRIP=llvm-strip
-          '';
+          devShells.default = pkgs.mkShell {
+            shellHook = ''
+              export STRIP=llvm-strip
+            '';
+            packages = [
+              pkgs.go
+              llvmPackages.clang-unwrapped
+              llvmPackages.llvm
+              pkgs.gnumake
+              pkgs.nodejs
+            ];
+          };
         };
-      }
-    );
+    };
 }

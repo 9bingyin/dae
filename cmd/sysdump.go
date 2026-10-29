@@ -1,12 +1,16 @@
 /*
  * SPDX-License-Identifier: AGPL-3.0-only
  * Copyright (c) 2022-2025, daeuniverse Organization <dae@v2raya.org>
+ * Copyright (c) 2026, 9bingyin
  */
 
 package cmd
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"os"
@@ -15,7 +19,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mholt/archiver/v3"
 	"github.com/shirou/gopsutil/v4/net"
 	"github.com/spf13/cobra"
 	"github.com/vishvananda/netlink"
@@ -47,12 +50,43 @@ func dumpNetworkInfo() {
 	dumpIPTables(tempDir)
 
 	tarFile := fmt.Sprintf("dae-sysdump.%d.tar.gz", time.Now().Unix())
-	if err := archiver.Archive([]string{tempDir}, tarFile); err != nil {
+	if err := archiveSysdump(tempDir, tarFile); err != nil {
 		fmt.Printf("Failed to create tar archive: %v\n", err)
 		return
 	}
 
 	fmt.Printf("System network information collected and saved to %s\n", tarFile)
+}
+
+func archiveSysdump(sourceDir, filename string) (err error) {
+	file, err := os.OpenFile(filename, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		return fmt.Errorf("create archive: %w", err)
+	}
+	defer func() {
+		if closeErr := file.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("close archive: %w", closeErr))
+		}
+	}()
+
+	compressed := gzip.NewWriter(file)
+	defer func() {
+		if closeErr := compressed.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("close gzip writer: %w", closeErr))
+		}
+	}()
+
+	archive := tar.NewWriter(compressed)
+	defer func() {
+		if closeErr := archive.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("close tar writer: %w", closeErr))
+		}
+	}()
+
+	if err := archive.AddFS(os.DirFS(sourceDir)); err != nil {
+		return fmt.Errorf("archive sysdump: %w", err)
+	}
+	return nil
 }
 
 // Translate scope enum into semantic words
