@@ -140,6 +140,17 @@ global {
     # fallback_resolver: '8.8.8.8:53'
 }
 
+# Optional sniffing exclusions. Rules use the same domain and dip/ip syntax as routing, including geosite/geoip.
+# Only the skip action is supported; unmatched flows keep the existing sniffing behavior.
+# IP-only rules bypass TCP/QUIC sniffing before reading or buffering handshake data.
+# Rules containing domain are checked after parsing and only discard the sniffed domain; payload is still relayed.
+# This does not bypass routing or DNS interception. Timeout remains global.sniffing_timeout.
+# sniffing {
+#     domain(suffix: push.apple.com) -> skip
+#     dip(91.105.192.0/23, '2001:67c:4e8::/48') -> skip
+#     domain(full: example.com) && dip(192.0.2.0/24) -> skip
+# }
+
 # Subscriptions defined here will be resolved as nodes and merged as a part of the global node pool.
 # Support to give the subscription a tag, and filter nodes from a given subscription in the group section.
 subscription {

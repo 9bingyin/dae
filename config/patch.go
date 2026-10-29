@@ -1,6 +1,7 @@
 /*
  * SPDX-License-Identifier: AGPL-3.0-only
  * Copyright (c) 2022-2025, daeuniverse Organization <dae@v2raya.org>
+ * Copyright (c) 2026, 9bingyin
  */
 
 package config
@@ -20,6 +21,11 @@ var patches = []patch{
 	patchTcpCheckHttpMethod,
 	patchEmptyDns,
 	patchMustOutbound,
+	patchSniffing,
+}
+
+func patchSniffing(params *Config) error {
+	return params.Sniffing.Validate()
 }
 
 func patchTcpCheckHttpMethod(params *Config) error {

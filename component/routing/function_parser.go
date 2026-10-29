@@ -1,6 +1,7 @@
 /*
  * SPDX-License-Identifier: AGPL-3.0-only
  * Copyright (c) 2022-2025, daeuniverse Organization <dae@v2raya.org>
+ * Copyright (c) 2026, 9bingyin
  */
 
 package routing
@@ -10,7 +11,6 @@ import (
 	"fmt"
 	"net/netip"
 	"strconv"
-	"strings"
 
 	"github.com/daeuniverse/dae/common"
 	"github.com/daeuniverse/dae/common/consts"
@@ -123,11 +123,11 @@ func ProcessNameParserFactory(callback func(f *config_parser.Function, procNames
 
 func parsePrefixes(values []string) (cidrs []netip.Prefix, err error) {
 	for _, value := range values {
-		toParse := value
-		if strings.LastIndexByte(value, '/') == -1 {
-			toParse += "/32"
+		if addr, err := netip.ParseAddr(value); err == nil {
+			cidrs = append(cidrs, netip.PrefixFrom(addr, addr.BitLen()))
+			continue
 		}
-		prefix, err := netip.ParsePrefix(toParse)
+		prefix, err := netip.ParsePrefix(value)
 		if err != nil {
 			return nil, fmt.Errorf("cannot parse %v: %w", value, err)
 		}

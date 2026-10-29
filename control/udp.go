@@ -146,6 +146,21 @@ func (c *ControlPlane) handlePkt(lConn *net.UDPConn, data []byte, src, pktDst, r
 	// We should cache DNS records and set record TTL to 0, in order to monitor the dns req and resp in real time.
 	isDns := dnsMessage != nil
 	if !isDns && !skipSniffing && !ueExists && c.sniffingTimeout > 0 {
+		skipSniffing, err = c.sniffingMatcher.SkipIP(realDst)
+		if err != nil {
+			return fmt.Errorf("match sniffing destination: %w", err)
+		}
+		if skipSniffing {
+			key := PacketSnifferKey{LAddr: realSrc, RAddr: realDst}
+			if pending := DefaultPacketSnifferSessionMgr.Get(key); pending != nil {
+				heldPackets := DefaultPacketSnifferSessionMgr.expire(key, pending)
+				if len(heldPackets) > 0 {
+					return c.flushHeldQuicPackets(lConn, heldPackets, data, src, pktDst, realDst, routingResult, "")
+				}
+			}
+		}
+	}
+	if !isDns && !skipSniffing && !ueExists && c.sniffingTimeout > 0 {
 		key := PacketSnifferKey{LAddr: realSrc, RAddr: realDst}
 		sniffer := DefaultPacketSnifferSessionMgr.Get(key)
 		if sniffer != nil || sniffing.IsLikelyQuicInitial(data) {
@@ -181,7 +196,14 @@ func (c *ControlPlane) handlePkt(lConn *net.UDPConn, data []byte, src, pktDst, r
 					}
 					if removed {
 						if result.State == sniffing.QuicSniffFound {
-							domain = result.Domain
+							skip, matchErr := c.sniffingMatcher.SkipDomain(realDst, result.Domain)
+							if matchErr != nil {
+								putHeldPackets(heldPackets)
+								return fmt.Errorf("match sniffed domain: %w", matchErr)
+							}
+							if !skip {
+								domain = result.Domain
+							}
 						}
 						if result.Err != nil && c.log.IsLevelEnabled(logrus.TraceLevel) {
 							c.log.WithError(result.Err).

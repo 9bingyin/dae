@@ -13,6 +13,10 @@ var SectionSummaryDesc = Desc{
 	"node":         "Nodes defined here will be merged as a part of the global node pool.",
 	"dns":          "See more at https://github.com/daeuniverse/dae/blob/main/docs/en/configuration/dns.md.",
 	"group":        "Node group. Groups defined here can be used as outbounds in section \"routing\".",
+	"sniffing": `Optional TCP/QUIC sniffing exclusions using the same domain and dip/ip rules as routing, including geosite/geoip.
+Only the skip action is supported. Any matching rule excludes the flow; unmatched flows keep the existing sniffing behavior.
+IP-only rules are evaluated before sniffing. Rules containing domain, optionally combined with dip/ip, discard matching sniffed domains after parsing.
+Skipping does not bypass routing or DNS interception. Timeout remains global.sniffing_timeout.`,
 	"routing": `Traffic follows this routing. See https://github.com/daeuniverse/dae/blob/main/docs/en/configuration/routing.md for full examples.
 Notice: domain traffic split will fail if DNS traffic is not taken over by dae.
 Built-in outbound: direct, must_direct, block.

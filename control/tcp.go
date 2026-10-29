@@ -1,6 +1,7 @@
 /*
  * SPDX-License-Identifier: AGPL-3.0-only
  * Copyright (c) 2022-2025, daeuniverse Organization <dae@v2raya.org>
+ * Copyright (c) 2026, 9bingyin
  */
 
 package control
@@ -26,18 +27,15 @@ import (
 func (c *ControlPlane) handleConn(lConn net.Conn) (err error) {
 	defer lConn.Close()
 
-	// Sniff target domain.
-	sniffer := sniffing.NewConnSniffer(lConn, c.sniffingTimeout)
-	// ConnSniffer should be used later, so we cannot close it now.
-	defer sniffer.Close()
-	domain, err := sniffer.SniffTcp()
-	if err != nil && !sniffing.IsSniffingError(err) {
-		return err
-	}
-
-	// Get tuples and outbound.
 	src := lConn.RemoteAddr().(*net.TCPAddr).AddrPort()
 	dst := lConn.LocalAddr().(*net.TCPAddr).AddrPort()
+	relayConn, domain, err := c.sniffTCP(lConn, dst)
+	if err != nil {
+		return err
+	}
+	defer relayConn.Close()
+
+	// Get tuples and outbound.
 	routingResult, err := c.core.RetrieveRoutingResult(src, dst, unix.IPPROTO_TCP)
 	if err != nil {
 		return fmt.Errorf("failed to retrieve target info %v: %v", dst.String(), err)
@@ -61,7 +59,7 @@ func (c *ControlPlane) handleConn(lConn net.Conn) (err error) {
 	}
 	defer rConn.Close()
 
-	if err = RelayTCP(sniffer, rConn); err != nil {
+	if err = RelayTCP(relayConn, rConn); err != nil {
 		switch {
 		case strings.HasSuffix(err.Error(), "write: broken pipe"),
 			strings.HasSuffix(err.Error(), "i/o timeout"),
@@ -75,6 +73,32 @@ func (c *ControlPlane) handleConn(lConn net.Conn) (err error) {
 		}
 	}
 	return nil
+}
+
+func (c *ControlPlane) sniffTCP(conn net.Conn, dst netip.AddrPort) (net.Conn, string, error) {
+	skip, err := c.sniffingMatcher.SkipIP(dst)
+	if err != nil {
+		return nil, "", fmt.Errorf("match sniffing destination: %w", err)
+	}
+	if skip {
+		return conn, "", nil
+	}
+
+	sniffer := sniffing.NewConnSniffer(conn, c.sniffingTimeout)
+	domain, err := sniffer.SniffTcp()
+	if err != nil && !sniffing.IsSniffingError(err) {
+		_ = sniffer.Close()
+		return nil, "", fmt.Errorf("sniff tcp: %w", err)
+	}
+	skip, err = c.sniffingMatcher.SkipDomain(dst, domain)
+	if err != nil {
+		_ = sniffer.Close()
+		return nil, "", fmt.Errorf("match sniffed domain: %w", err)
+	}
+	if skip {
+		domain = ""
+	}
+	return sniffer, domain, nil
 }
 
 type RouteDialParam struct {

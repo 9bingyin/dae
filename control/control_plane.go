@@ -91,6 +91,7 @@ type ControlPlane struct {
 	lanInterface []string
 
 	sniffingTimeout   time.Duration
+	sniffingMatcher   *SniffingMatcher
 	tproxyPortProtect bool
 	soMarkFromDae     uint32
 	mptcp             bool
@@ -107,16 +108,25 @@ func NewControlPlane(
 	tagToNodeList map[string][]string,
 	groups []config.Group,
 	routingA *config.Routing,
+	sniffingConfig *config.Sniffing,
 	global *config.Global,
 	dnsConfig *config.Dns,
 	externGeoDataDirs []string,
 ) (*ControlPlane, error) {
+	locationFinder := assets.NewLocationFinder(externGeoDataDirs)
+	var sniffingRules []*config_parser.RoutingRule
+	if sniffingConfig != nil {
+		sniffingRules = sniffingConfig.Rules
+	}
+	sniffingMatcher, err := NewSniffingMatcher(log, sniffingRules, locationFinder)
+	if err != nil {
+		return nil, fmt.Errorf("build sniffing policy: %w", err)
+	}
+
 	// TODO: Some users reported that enabling GSO on the client would affect the performance of watching YouTube, so we disabled it by default.
 	if _, ok := os.LookupEnv("QUIC_GO_DISABLE_GSO"); !ok {
 		os.Setenv("QUIC_GO_DISABLE_GSO", "1")
 	}
-
-	var err error
 
 	kernelVersion, e := internal.KernelVersion()
 	if e != nil {
@@ -365,7 +375,6 @@ func NewControlPlane(
 		outboundId2Name[uint8(i)] = o.Name
 	}
 	// Apply rules optimizers.
-	locationFinder := assets.NewLocationFinder(externGeoDataDirs)
 	var rules []*config_parser.RoutingRule
 	if rules, err = routing.ApplyRulesOptimizers(routingA.Rules,
 		&routing.AliasOptimizer{},
@@ -416,6 +425,7 @@ func NewControlPlane(
 		lanInterface:      global.LanInterface,
 		wanInterface:      global.WanInterface,
 		sniffingTimeout:   sniffingTimeout,
+		sniffingMatcher:   sniffingMatcher,
 		tproxyPortProtect: global.TproxyPortProtect,
 		soMarkFromDae:     global.SoMarkFromDae,
 		mptcp:             global.Mptcp,

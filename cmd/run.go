@@ -458,6 +458,7 @@ func newControlPlane(log *logrus.Logger, bpf interface{}, dnsCache map[string]*c
 		tagToNodeList,
 		conf.Group,
 		&conf.Routing,
+		&conf.Sniffing,
 		&conf.Global,
 		&conf.Dns,
 		externGeoDataDirs,
